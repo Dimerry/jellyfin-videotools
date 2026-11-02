@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
@@ -92,6 +93,15 @@ public class SqlSearchProvider : IInternalSearchProvider
             return [];
         }
 
+        // A term that looks like a file extension (e.g. ".ts", ".mp4", ".old.mp4") searches the
+        // file path suffix instead of the item name: item names never contain the extension, and
+        // the punctuation-stripped clean term would otherwise just match unrelated titles
+        // (searching ".ts" would degenerate to "ts" and hit every title containing those letters).
+        if (Regex.IsMatch(rawSearchTerm, "^\\.[A-Za-z0-9]{1,5}(?:\\.[A-Za-z0-9]{1,5})*$"))
+        {
+            return await SearchByExtensionAsync(query, rawSearchTerm, cancellationToken).ConfigureAwait(false);
+        }
+
         var cleanSearchTerm = rawSearchTerm.GetCleanValue();
         if (string.IsNullOrEmpty(cleanSearchTerm))
         {
@@ -154,6 +164,57 @@ public class SqlSearchProvider : IInternalSearchProvider
                     : e.CleanName!.StartsWith(cleanSearchTerm) ? PrefixMatchScore
                     : e.CleanName!.Contains(cleanPrefix) ? WordPrefixMatchScore
                     : ContainsMatchScore
+            });
+
+            return await scored
+                .OrderByDescending(x => x.Score)
+                .ThenBy(x => x.Id)
+                .Take(limit)
+                .Select(x => new SearchResult(x.Id, x.Score))
+                .ToArrayAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Searches by file path suffix for terms that look like file extensions.
+    /// </summary>
+    /// <param name="query">The provider query.</param>
+    /// <param name="rawSearchTerm">The trimmed search term (e.g. ".ts" or ".old.mp4").</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The matching search results.</returns>
+    private async Task<IReadOnlyList<SearchResult>> SearchByExtensionAsync(
+        SearchProviderQuery query,
+        string rawSearchTerm,
+        CancellationToken cancellationToken)
+    {
+        // A path ending in ".ts" has the final extension .ts (multi-suffix tails like
+        // "foo.old.ts" are legitimately found by both ".ts" and ".old.ts"). SQLite LIKE is
+        // case-insensitive for ASCII, which covers file extensions; the validated term can
+        // only contain alphanumerics and dots, so no LIKE wildcard escaping is needed.
+        var likeSuffix = "%" + rawSearchTerm;
+
+        var limit = query.Limit ?? DefaultSearchLimit;
+
+        var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var dbQuery = dbContext.BaseItems
+                .AsNoTracking()
+                .Where(e => e.Id != _placeholderId)
+                .Where(e => !e.IsVirtualItem)
+                .Where(e => e.Path != null && EF.Functions.Like(e.Path, likeSuffix));
+
+            dbQuery = ApplyTypeFilter(dbQuery, query.IncludeItemTypes, query.ExcludeItemTypes);
+            dbQuery = ApplyMediaTypeFilter(dbQuery, query.MediaTypes);
+            dbQuery = ApplyParentFilter(dbQuery, query.ParentId);
+            dbQuery = ApplyUserAccessFilter(dbContext, dbQuery, query);
+            dbQuery = ExcludeVersionsOfMatchedPrimaries(dbQuery);
+
+            var scored = dbQuery.Select(e => new
+            {
+                e.Id,
+                Score = ExactMatchScore
             });
 
             return await scored
