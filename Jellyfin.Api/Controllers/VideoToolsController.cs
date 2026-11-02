@@ -14,6 +14,8 @@ using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -47,6 +49,8 @@ public class VideoToolsController : BaseJellyfinApiController
     private readonly ILibraryManager _libraryManager;
     private readonly ILibraryMonitor _libraryMonitor;
     private readonly IMediaEncoder _mediaEncoder;
+    private readonly IProviderManager _providerManager;
+    private readonly IDirectoryService _directoryService;
     private readonly ILogger<VideoToolsController> _logger;
 
     /// <summary>
@@ -55,16 +59,22 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
     /// <param name="libraryMonitor">Instance of the <see cref="ILibraryMonitor"/> interface.</param>
     /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
+    /// <param name="providerManager">Instance of the <see cref="IProviderManager"/> interface.</param>
+    /// <param name="directoryService">Instance of the <see cref="IDirectoryService"/> interface.</param>
     /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
     public VideoToolsController(
         ILibraryManager libraryManager,
         ILibraryMonitor libraryMonitor,
         IMediaEncoder mediaEncoder,
+        IProviderManager providerManager,
+        IDirectoryService directoryService,
         ILogger<VideoToolsController> logger)
     {
         _libraryManager = libraryManager;
         _libraryMonitor = libraryMonitor;
         _mediaEncoder = mediaEncoder;
+        _providerManager = providerManager;
+        _directoryService = directoryService;
         _logger = logger;
     }
 
@@ -218,7 +228,7 @@ public class VideoToolsController : BaseJellyfinApiController
 
         var args = BuildCutArgs(sourcePath, paths.WorkPath, startSeconds, keepSeconds, rotation);
 
-        var job = CreateJob("Cut", item.Name, paths.FinalPath, sourcePath, duration);
+        var job = CreateJob("Cut", item.Id, item.Name, paths.FinalPath, sourcePath, duration);
         job.WorkPath = paths.WorkPath;
         job.CutStartSeconds = startSeconds;
         job.CutEndSeconds = endSeconds;
@@ -310,7 +320,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 var paths = CreateTranscodePaths(failedJob.SourcePath);
                 var outputPath = paths.FinalPath;
 
-                var job = CreateJob("Transcode", failedJob.ItemName, outputPath, failedJob.SourcePath, duration);
+                var job = CreateJob("Transcode", failedJob.ItemId, failedJob.ItemName, outputPath, failedJob.SourcePath, duration);
                 job.WorkPath = paths.WorkPath;
                 job.Codec = codec == "av1" ? "AV1" : "H.265";
                 job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
@@ -331,7 +341,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 var keepSeconds = duration - startSeconds - endSeconds;
                 var paths = CreateCutPaths(failedJob.SourcePath);
 
-                var job = CreateJob("Cut", failedJob.ItemName, paths.FinalPath, failedJob.SourcePath, duration);
+                var job = CreateJob("Cut", failedJob.ItemId, failedJob.ItemName, paths.FinalPath, failedJob.SourcePath, duration);
                 job.WorkPath = paths.WorkPath;
                 job.CutStartSeconds = startSeconds;
                 job.CutEndSeconds = endSeconds;
@@ -920,7 +930,7 @@ public class VideoToolsController : BaseJellyfinApiController
 
         var paths = CreateTranscodePaths(sourcePath);
 
-        var job = CreateJob("Transcode", item.Name, paths.FinalPath, sourcePath, duration);
+        var job = CreateJob("Transcode", item.Id, item.Name, paths.FinalPath, sourcePath, duration);
         job.WorkPath = paths.WorkPath;
         job.Codec = codec == "av1" ? "AV1" : "H.265";
         job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
@@ -929,12 +939,13 @@ public class VideoToolsController : BaseJellyfinApiController
         return job;
     }
 
-    private static VideoToolJobDto CreateJob(string kind, string itemName, string outputPath, string sourcePath, double duration)
+    private static VideoToolJobDto CreateJob(string kind, Guid itemId, string itemName, string outputPath, string sourcePath, double duration)
     {
         var job = new VideoToolJobDto
         {
             Id = Guid.NewGuid(),
             Kind = kind,
+            ItemId = itemId,
             ItemName = itemName,
             OutputPath = outputPath,
             Status = "Queued",
@@ -1298,7 +1309,7 @@ public class VideoToolsController : BaseJellyfinApiController
             // A new job arrived; postpone the pending folder scan until the queue is idle again.
             _scanCts?.Cancel();
             _scanCts = null;
-            _pending.Enqueue(new JobWork(job, attempts, encoderPath, _libraryMonitor, _logger));
+            _pending.Enqueue(new JobWork(job, attempts, encoderPath, _libraryMonitor, _libraryManager, _providerManager, _directoryService, _logger));
         }
 
         UpdateQueuePositions();
@@ -1361,8 +1372,136 @@ public class VideoToolsController : BaseJellyfinApiController
 
                 UpdateQueuePositions();
                 ScheduleScanIfIdle(work.LibraryMonitor, work.Logger);
+                RefreshPosterAfterCut(work);
             }
         }
+    }
+
+    /// <summary>
+    /// A cut replaces the video in place, so the stored primary image still shows the untrimmed
+    /// frame. Re-grab the poster from the new file, silently and without a library scan.
+    /// Transcoded output keeps the same content and duration, so its poster is left alone.
+    /// </summary>
+    /// <param name="work">The finished job.</param>
+    private static void RefreshPosterAfterCut(JobWork work)
+    {
+        var job = work.Job;
+        if (!string.Equals(job.Kind, "Cut", StringComparison.Ordinal)
+            || !string.Equals(job.Status, "Completed", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        try
+        {
+            var item = work.LibraryManager.GetItemById(job.ItemId);
+            if (item is null)
+            {
+                work.Logger.LogWarning("Video tool job {JobId}: item {ItemId} not found, skipping poster refresh", job.Id, job.ItemId);
+                return;
+            }
+
+            var outputPath = job.OutputPath;
+            if (string.IsNullOrWhiteSpace(outputPath) || !System.IO.File.Exists(outputPath))
+            {
+                return;
+            }
+
+            var keepSeconds = job.SourceDurationSeconds - job.CutStartSeconds - job.CutEndSeconds;
+            if (!double.IsFinite(keepSeconds) || keepSeconds <= 0)
+            {
+                return;
+            }
+
+            // Same 10% offset the screen grabber provider uses, measured on the trimmed duration
+            // so the frame comes from the new content rather than the old one.
+            var grabSeconds = Math.Min(keepSeconds * 0.1, Math.Max(keepSeconds - 1, 0));
+            var tempPath = Path.Combine(Path.GetTempPath(), "videotools-poster-" + job.Id.ToString("N") + ".jpg");
+
+            var error = RenderStillFrame(work.EncoderPath, outputPath, grabSeconds, tempPath);
+            if (error is not null)
+            {
+                work.Logger.LogWarning("Video tool job {JobId}: poster frame extraction failed: {Error}", job.Id, error);
+                return;
+            }
+
+            // SaveImage consumes (and deletes) the extracted file.
+            work.ProviderManager.SaveImage(item, tempPath, "image/jpeg", ImageType.Primary, null, null, CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+
+            work.Logger.LogInformation("Video tool job {JobId}: poster re-extracted from the trimmed video", job.Id);
+        }
+        catch (Exception ex)
+        {
+            // A stale poster is cosmetic; never turn it into a failed job or a crashed queue loop.
+            work.Logger.LogError(ex, "Video tool job {JobId}: poster refresh failed", work.Job.Id);
+        }
+    }
+
+    /// <summary>
+    /// Grabs a single frame as JPEG. Returns null on success, otherwise the failure message.
+    /// </summary>
+    private static string? RenderStillFrame(string encoderPath, string sourcePath, double timeSeconds, string outputPath)
+    {
+        var args = new List<string>
+        {
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-ss", timeSeconds.ToString("0.###", CultureInfo.InvariantCulture),
+            "-i", sourcePath,
+            "-frames:v", "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf", "scale=720:-2",
+            "-q:v", "4",
+            "-update", "1",
+            "-f", "image2",
+            outputPath
+        };
+
+        var startInfo = new ProcessStartInfo(encoderPath)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var arg in args)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        using var process = Process.Start(startInfo);
+        if (process is null)
+        {
+            return "ffmpeg could not be started.";
+        }
+
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(TimeSpan.FromSeconds(30)))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (Exception)
+            {
+                // Best effort.
+            }
+
+            return "ffmpeg timed out.";
+        }
+
+        var stderr = stderrTask.GetAwaiter().GetResult();
+        if (process.ExitCode != 0 || !System.IO.File.Exists(outputPath))
+        {
+            return string.IsNullOrWhiteSpace(stderr) ? "ffmpeg failed." : stderr.Trim();
+        }
+
+        return null;
     }
 
     private static void AddFolderForScan(string outputPath)
@@ -1757,5 +1896,8 @@ public class VideoToolsController : BaseJellyfinApiController
         IReadOnlyList<TranscodePlanner.Attempt> Attempts,
         string EncoderPath,
         ILibraryMonitor LibraryMonitor,
+        ILibraryManager LibraryManager,
+        IProviderManager ProviderManager,
+        IDirectoryService DirectoryService,
         ILogger Logger);
 }

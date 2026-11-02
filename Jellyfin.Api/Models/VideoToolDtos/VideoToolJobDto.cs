@@ -108,6 +108,12 @@ public sealed class VideoToolJobDto
     public string SourcePath { get; set; } = string.Empty;
 
     /// <summary>
+    /// Gets or sets the library item this job operates on. Not exposed over the API.
+    /// </summary>
+    [JsonIgnore]
+    public Guid ItemId { get; set; }
+
+    /// <summary>
     /// Gets or sets the source duration in seconds. Not exposed over the API.
     /// </summary>
     [JsonIgnore]
