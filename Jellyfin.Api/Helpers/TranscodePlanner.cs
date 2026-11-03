@@ -136,13 +136,16 @@ internal static class TranscodePlanner
             && forced != SoftwareOnly)
         {
             var seen = new HashSet<string>(StringComparer.Ordinal);
+            var parallelAttempts = new List<Attempt>();
             foreach (var attempt in attempts)
             {
                 if (seen.Add(attempt.Encoder))
                 {
-                    attempts.Insert(0, BuildParallelAttempt(request, attempt.Encoder));
+                    parallelAttempts.Add(BuildParallelAttempt(request, attempt.Encoder));
                 }
             }
+
+            attempts.InsertRange(0, parallelAttempts);
         }
 
         return attempts;
