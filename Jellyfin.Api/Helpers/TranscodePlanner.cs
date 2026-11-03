@@ -26,6 +26,16 @@ internal static class TranscodePlanner
     /// </summary>
     private const int HardwareFailureLimit = 2;
 
+    /// <summary>
+    /// Sources measured below this frame rate are considered "low frame rate" for interpolation.
+    /// </summary>
+    private const double InterpolationSourceFloor = 23.0;
+
+    /// <summary>
+    /// Frame rates outside this range are treated as broken container metadata instead of truth.
+    /// </summary>
+    private const double MaxPlausibleFrameRate = 240.0;
+
     private const string QsvOnly = "qsv";
 
     private const string NvencOnly = "nvenc";
@@ -62,12 +72,19 @@ internal static class TranscodePlanner
         var forced = GetForcedEncoder();
         var available = GetAvailableEncoders(request.FfmpegPath);
         var attempts = new List<Attempt>();
+        var interpolate = ShouldInterpolate(request);
 
         foreach (var (encoder, label) in GetCandidates(isAv1))
         {
             var isHardware = IsHardwareEncoder(encoder);
 
-            if (isHardware)
+            // Motion interpolation needs the frames on the CPU: QSV/CUDA decoders output GPU
+            // surfaces the minterpolate filter cannot read, so interpolation forces software decode.
+            if (isHardware && interpolate)
+            {
+                // Fall through to the software-decoded variant below; the hardware *encoder* is kept.
+            }
+            else if (isHardware)
             {
                 if (forced == SoftwareOnly
                     || (forced == QsvOnly && !encoder.EndsWith("_qsv", StringComparison.Ordinal))
@@ -227,6 +244,7 @@ internal static class TranscodePlanner
         bool isHardware)
     {
         var isAv1 = string.Equals(request.Codec, "av1", StringComparison.OrdinalIgnoreCase);
+        var interpolate = ShouldInterpolate(request);
         var args = new List<string>
         {
             "-hide_banner",
@@ -248,15 +266,27 @@ internal static class TranscodePlanner
         args.Add(request.SourcePath);
 
         var targetSize = GetTargetSize(request);
+        var filters = new List<string>();
         if (targetSize is { } size)
         {
-            args.Add("-vf");
-            args.Add(decode switch
+            filters.Add(decode switch
             {
                 DecodeMode.Qsv => string.Create(CultureInfo.InvariantCulture, $"scale_qsv={size.Width}:{size.Height}"),
                 DecodeMode.Cuda => string.Create(CultureInfo.InvariantCulture, $"scale_cuda={size.Width}:{size.Height}"),
                 _ => string.Create(CultureInfo.InvariantCulture, $"scale={size.Width}:{size.Height}")
             });
+        }
+
+        if (interpolate)
+        {
+            // Motion-compensated interpolation on the CPU; the hardware *encoder* is unaffected.
+            filters.Add("minterpolate=fps=30:mi_mode=mci:me_mode=bidir:mc_mode=aobmc:vsbmc=1");
+        }
+
+        if (filters.Count > 0)
+        {
+            args.Add("-vf");
+            args.Add(string.Join(",", filters));
         }
 
         args.AddRange(
@@ -278,7 +308,9 @@ internal static class TranscodePlanner
         // The encoder derives its frame-rate based bitrate control from the stream frame rate, which
         // is wrong on lots of remuxed/phone files (120/1 reported for a 30 fps video). A 3000k
         // request then yields a quarter of the bitrate. Pin the output rate to the real rate.
-        var frameRate = GetEncoderFrameRate(request);
+        // With interpolation the target rate is always 30; without one, only a plausible source
+        // rate is pinned (a garbage 1000/1 "tbr" would burst the encoder's frame count/budget).
+        var frameRate = interpolate ? 30.0 : GetEncoderFrameRate(request);
         if (frameRate > 0)
         {
             args.Add("-r");
@@ -329,6 +361,25 @@ internal static class TranscodePlanner
             "h264" or "hevc" or "av1" or "vp8" or "vp9" or "mpeg2video" or "vc1" or "mjpeg" => true,
             _ => false
         };
+    }
+
+    /// <summary>
+    /// Tells whether the request asked for interpolation and the source actually qualifies
+    /// (a usable, plausible frame rate below the floor).
+    /// </summary>
+    /// <param name="request">The transcode request.</param>
+    /// <returns><c>true</c> when the source should be motion-interpolated to 30 fps.</returns>
+    private static bool ShouldInterpolate(Request request)
+    {
+        if (!request.Interpolate)
+        {
+            return false;
+        }
+
+        var rate = request.FrameRate >= 1
+            ? request.FrameRate
+            : request.NominalFrameRate;
+        return rate >= 1 && rate <= MaxPlausibleFrameRate && rate < InterpolationSourceFloor;
     }
 
     private static double GetEncoderFrameRate(Request request)
@@ -438,6 +489,12 @@ internal static class TranscodePlanner
         /// Gets the ffmpeg binary used to list the available encoders.
         /// </summary>
         public string FfmpegPath { get; init; } = "ffmpeg";
+
+        /// <summary>
+        /// Gets a value indicating whether a low frame rate source should be interpolated to 30 fps.
+        /// Only honored when the measured rate is plausible and below the floor.
+        /// </summary>
+        public bool Interpolate { get; init; }
     }
 
     /// <summary>

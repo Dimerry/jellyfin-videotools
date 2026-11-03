@@ -39,6 +39,12 @@ public sealed class VideoToolJobDto
     public int? BitrateKbps { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether this transcode motion-interpolates a low frame
+    /// rate source up to 30 fps.
+    /// </summary>
+    public bool FrameInterpolation { get; set; }
+
+    /// <summary>
     /// Gets or sets the encoder that produced (or is producing) the output, e.g. <c>hevc_nvenc</c>.
     /// </summary>
     public string? Encoder { get; set; }

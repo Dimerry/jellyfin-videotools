@@ -87,13 +87,15 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="codec">Target codec: h265 (default, QSV) or av1 (software, slower).</param>
     /// <param name="bitrateKbps">Target video bitrate in kbps.</param>
     /// <param name="resolution">Maximum output resolution: 1080p (default) or 4k. Sources smaller than the limit are not upscaled.</param>
+    /// <param name="interpolate">When true, sources below 23 fps are motion-interpolated to 30 fps.</param>
     /// <returns>The created job.</returns>
     [HttpPost("{itemId}/Transcode")]
     public ActionResult<VideoToolJobDto> StartTranscode(
         [FromRoute] Guid itemId,
         [FromQuery] string codec = "h265",
         [FromQuery] int bitrateKbps = 3000,
-        [FromQuery] string resolution = "1080p")
+        [FromQuery] string resolution = "1080p",
+        [FromQuery] bool interpolate = false)
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -106,7 +108,7 @@ public class VideoToolsController : BaseJellyfinApiController
             return BadRequest(error);
         }
 
-        var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight);
+        var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate);
         if (job is null)
         {
             return BadRequest("Item has no local video file.");
@@ -123,13 +125,15 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="codec">Target codec: h265 (default, QSV) or av1 (software, slower).</param>
     /// <param name="bitrateKbps">Target video bitrate in kbps.</param>
     /// <param name="resolution">Maximum output resolution: 1080p (default) or 4k.</param>
+    /// <param name="interpolate">When true, sources below 23 fps are motion-interpolated to 30 fps.</param>
     /// <returns>The queued jobs and the names of the items that were skipped.</returns>
     [HttpPost("Transcode")]
     public ActionResult<TranscodeBatchResultDto> StartTranscodeBatch(
         [FromBody] Guid[] itemIds,
         [FromQuery] string codec = "h265",
         [FromQuery] int bitrateKbps = 3000,
-        [FromQuery] string resolution = "1080p")
+        [FromQuery] string resolution = "1080p",
+        [FromQuery] bool interpolate = false)
     {
         if (itemIds is null || itemIds.Length == 0)
         {
@@ -151,7 +155,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 continue;
             }
 
-            var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight);
+            var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate);
             if (job is null)
             {
                 result.SkippedNames.Add(item.Name);
@@ -316,6 +320,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 var codec = string.Equals(failedJob.Codec, "AV1", StringComparison.OrdinalIgnoreCase) ? "av1" : "h265";
                 var maxHeight = string.Equals(failedJob.Resolution, "4K", StringComparison.OrdinalIgnoreCase) ? 2160 : 1080;
                 var bitrateKbps = failedJob.BitrateKbps ?? 3000;
+                var interpolate = failedJob.FrameInterpolation;
 
                 var paths = CreateTranscodePaths(failedJob.SourcePath);
                 var outputPath = paths.FinalPath;
@@ -325,7 +330,8 @@ public class VideoToolsController : BaseJellyfinApiController
                 job.Codec = codec == "av1" ? "AV1" : "H.265";
                 job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
                 job.BitrateKbps = bitrateKbps;
-                StartJob(job, BuildTranscodePlan(probe, failedJob.SourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight));
+                job.FrameInterpolation = interpolate;
+                StartJob(job, BuildTranscodePlan(probe, failedJob.SourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, interpolate));
                 return Accepted(job);
             }
 
@@ -913,7 +919,7 @@ public class VideoToolsController : BaseJellyfinApiController
         return true;
     }
 
-    private VideoToolJobDto? EnqueueTranscode(BaseItem item, string codec, int bitrateKbps, int maxHeight)
+    private VideoToolJobDto? EnqueueTranscode(BaseItem item, string codec, int bitrateKbps, int maxHeight, bool interpolate)
     {
         var sourcePath = item.Path;
         if (string.IsNullOrWhiteSpace(sourcePath) || !System.IO.File.Exists(sourcePath))
@@ -935,7 +941,8 @@ public class VideoToolsController : BaseJellyfinApiController
         job.Codec = codec == "av1" ? "AV1" : "H.265";
         job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
         job.BitrateKbps = bitrateKbps;
-        StartJob(job, BuildTranscodePlan(probe, sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight));
+        job.FrameInterpolation = interpolate;
+        StartJob(job, BuildTranscodePlan(probe, sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, interpolate));
         return job;
     }
 
@@ -998,6 +1005,7 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="codec">The target codec.</param>
     /// <param name="bitrateKbps">The target bitrate.</param>
     /// <param name="maxHeight">The maximum output height.</param>
+    /// <param name="interpolate">Whether to motion-interpolate a low frame rate source to 30 fps.</param>
     /// <returns>The attempts to run in order.</returns>
     private IReadOnlyList<TranscodePlanner.Attempt> BuildTranscodePlan(
         MediaProbe probe,
@@ -1005,7 +1013,8 @@ public class VideoToolsController : BaseJellyfinApiController
         string workPath,
         string codec,
         int bitrateKbps,
-        int maxHeight)
+        int maxHeight,
+        bool interpolate = false)
     {
         var ffmpegPath = string.IsNullOrWhiteSpace(_mediaEncoder.EncoderPath) ? "ffmpeg" : _mediaEncoder.EncoderPath;
         var plan = TranscodePlanner.Build(new TranscodePlanner.Request
@@ -1021,7 +1030,8 @@ public class VideoToolsController : BaseJellyfinApiController
             FrameRate = probe.FrameRate,
             NominalFrameRate = probe.NominalFrameRate,
             SubtitleIndexes = probe.SubtitleIndexes ?? Array.Empty<int>(),
-            FfmpegPath = ffmpegPath
+            FfmpegPath = ffmpegPath,
+            Interpolate = interpolate
         });
 
         _logger.LogInformation(
@@ -1152,11 +1162,124 @@ public class VideoToolsController : BaseJellyfinApiController
                 }
             }
 
+            // Container frame rates are frequently garbage (avg 0/0, or a bogus 1000/1 "tbr" on
+            // WMV/ASF). Trust them only inside a sane range; otherwise infer the real rate from
+            // packet timestamps so the encoder gets a usable -r (and interpolation a usable source rate).
+            if (!IsPlausibleFrameRate(frameRate))
+            {
+                frameRate = 0;
+            }
+
+            if (!IsPlausibleFrameRate(nominalFrameRate))
+            {
+                nominalFrameRate = 0;
+            }
+
+            if (frameRate <= 0 && nominalFrameRate > 0)
+            {
+                // TranscodePlanner prefers the measured rate; fall back to the nominal one.
+                frameRate = nominalFrameRate;
+                nominalFrameRate = 0;
+            }
+
+            if (frameRate <= 0)
+            {
+                frameRate = InferFrameRateFromPackets(sourcePath, probePath);
+            }
+
             return new MediaProbe(duration, width, height, subtitleIndexes, frameRate, nominalFrameRate, videoCodec);
         }
         catch (Exception)
         {
             return default;
+        }
+    }
+
+    /// <summary>
+    /// Frame rates outside this range are treated as broken container metadata instead of truth.
+    /// </summary>
+    private static bool IsPlausibleFrameRate(double fps)
+        => fps >= 1 && fps <= 240;
+
+    /// <summary>
+    /// Estimates the real frame rate from the PTS of the first video packets. Used when the
+    /// container reports no usable frame rate (e.g. WMV files advertising 1000/1).
+    /// </summary>
+    /// <param name="sourcePath">The source file path.</param>
+    /// <param name="probePath">The ffprobe binary.</param>
+    /// <returns>The estimated frames per second, or 0 when it cannot be determined.</returns>
+    private static double InferFrameRateFromPackets(string sourcePath, string probePath)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo(probePath)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            startInfo.ArgumentList.Add("-v");
+            startInfo.ArgumentList.Add("error");
+            startInfo.ArgumentList.Add("-select_streams");
+            startInfo.ArgumentList.Add("v:0");
+            startInfo.ArgumentList.Add("-show_entries");
+            startInfo.ArgumentList.Add("packet=pts_time");
+            startInfo.ArgumentList.Add("-of");
+            startInfo.ArgumentList.Add("csv=p=0");
+            startInfo.ArgumentList.Add("-read_intervals");
+            startInfo.ArgumentList.Add("%+#120");
+            startInfo.ArgumentList.Add(sourcePath);
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return 0;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(15000);
+
+            var deltas = new List<double>();
+            double last = 0;
+            var haveLast = false;
+            foreach (var rawLine in output.Split('\n'))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0
+                    || !double.TryParse(line, NumberStyles.Float, CultureInfo.InvariantCulture, out var pts)
+                    || double.IsNaN(pts))
+                {
+                    continue;
+                }
+
+                if (haveLast && pts - last > 0.0005)
+                {
+                    deltas.Add(pts - last);
+                }
+
+                last = pts;
+                haveLast = true;
+            }
+
+            if (deltas.Count < 10)
+            {
+                return 0;
+            }
+
+            deltas.Sort();
+            var median = deltas[deltas.Count / 2];
+            if (median <= 0)
+            {
+                return 0;
+            }
+
+            var fps = 1.0 / median;
+            return IsPlausibleFrameRate(fps) ? Math.Round(fps, 3) : 0;
+        }
+        catch (Exception)
+        {
+            return 0;
         }
     }
 
