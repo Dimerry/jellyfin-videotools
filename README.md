@@ -110,7 +110,7 @@
 - 只探测一次并缓存（path + mtime + size），有 `ctts` 的文件直接返回不启动进程；分片 MP4（moof）和 mkv/其它容器不受影响。
 - 命中时会打一条日志：`MP4 file ... has B-frames but no composition time offsets (ctts); direct play disabled`。
 - 开关：环境变量 `VIDEOTOOLS_NO_CTTS_TRANSCODE=0` 可关闭这套自动转码。
-- 背景数据：本机 12265 个 mp4 里查出 810 个（92.7 GB）带这个毛病，基本都是某个“无损转封装”工具做出来的；扫描脚本 `scripts/scan-ctts.py`。
+- 扫描脚本：`scripts/scan-ctts.py` 可批量扫媒体库并统计这类文件（输出文件列表和总大小）。
 
 ### 8. 搜索词按扩展名匹配 — `Jellyfin.Library/Search/SqlSearchProvider.cs`
 
@@ -157,7 +157,7 @@ The server is expected to host the web client, but the provided content director
 - **启动后转码立刻失败，日志里有 `Error while opening encoder`**：ffmpeg 这个编码器在编译时带了、但机器上没有对应硬件。这是正常的，规划器会自动跳到下一个编码器；如果连软件编码也失败，才需要看具体报错。
 - **端口不是 8096**：端口读的是数据目录里 `config/network.xml` 的 `InternalHttpPort`，不是默认值，别照抄别人的地址。
 
-> 默认端口 8096；作者本机跑在 8196，纯属习惯。
+> 默认端口 8096。
 
 ### 打包成 .deb（推荐给不想装 .NET 的人）
 
