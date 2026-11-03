@@ -32,6 +32,22 @@ internal static class TranscodePlanner
     private const double InterpolationSourceFloor = 23.0;
 
     /// <summary>
+    /// Sources shorter than this are interpolated in a single pass; splitting adds no value there.
+    /// </summary>
+    private const double ParallelInterpolationMinDuration = 120.0;
+
+    /// <summary>
+    /// Target length of one parallel interpolation segment in seconds (before the pre-roll overlap).
+    /// </summary>
+    private const double ParallelSegmentSeconds = 120.0;
+
+    /// <summary>
+    /// Seconds re-decoded at the start of every segment so motion estimation has context.
+    /// The overlap is trimmed frame-accurately before encoding.
+    /// </summary>
+    private const double ParallelPreRollSeconds = 1.0;
+
+    /// <summary>
     /// Frame rates outside this range are treated as broken container metadata instead of truth.
     /// </summary>
     private const double MaxPlausibleFrameRate = 240.0;
@@ -110,7 +126,55 @@ internal static class TranscodePlanner
             attempts.Add(BuildAttempt(request, encoder, label, DecodeMode.Software, isHardware));
         }
 
+        // minterpolate is single-threaded inside ffmpeg, so a single pass saturates one core and a
+        // 20-core NAS finishes a 15-minute source in three quarters of an hour. When the source is
+        // long enough, offer a segmented plan first: N ffmpeg workers each interpolate+encode a
+        // slice (with a short pre-roll for motion context), the worker concatenates afterwards.
+        // It is tried before the single-pass attempts; if any stage fails the chain falls back.
+        if (interpolate
+            && request.Duration > ParallelInterpolationMinDuration
+            && forced != SoftwareOnly)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var attempt in attempts)
+            {
+                if (seen.Add(attempt.Encoder))
+                {
+                    attempts.Insert(0, BuildParallelAttempt(request, attempt.Encoder));
+                }
+            }
+        }
+
         return attempts;
+    }
+
+    /// <summary>
+    /// Builds the segmented interpolation attempt for one encoder. The attempt carries the
+    /// segment geometry; <see cref="Controllers.VideoToolsController"/> runs the stages and
+    /// concatenates the outputs itself.
+    /// </summary>
+    /// <param name="request">The transcode request.</param>
+    /// <param name="encoder">The video encoder to use for every segment.</param>
+    /// <returns>The parallel attempt.</returns>
+    private static Attempt BuildParallelAttempt(Request request, string encoder)
+    {
+        var segments = Math.Max(2, Math.Min(12, (int)Math.Ceiling(request.Duration / ParallelSegmentSeconds)));
+        var isAv1 = string.Equals(request.Codec, "av1", StringComparison.OrdinalIgnoreCase);
+        var label = "Segmented interpolation x" + segments.ToString(CultureInfo.InvariantCulture);
+
+        var plan = new ParallelInterpolationPlan(
+            request.SourcePath,
+            request.OutputPath,
+            request.Duration,
+            segments,
+            ParallelPreRollSeconds,
+            encoder,
+            isAv1 ? "8" : "medium",
+            request.BitrateKbps,
+            GetTargetSize(request));
+
+        // Args stay empty: the segmented pipeline is driven by the controller, not by one process.
+        return new Attempt([], encoder, IsHardwareEncoder(encoder), false, label, plan);
     }
 
     /// <summary>
@@ -436,6 +500,11 @@ internal static class TranscodePlanner
         public string SourcePath { get; init; } = string.Empty;
 
         /// <summary>
+        /// Gets the source duration in seconds, used to size the segmented interpolation plan.
+        /// </summary>
+        public double Duration { get; init; }
+
+        /// <summary>
         /// Gets the temporary output path.
         /// </summary>
         public string OutputPath { get; init; } = string.Empty;
@@ -498,6 +567,30 @@ internal static class TranscodePlanner
     }
 
     /// <summary>
+    /// Geometry of a segmented interpolation job: the controller splits the source into this many
+    /// overlapping slices, encodes them concurrently and concatenates the results.
+    /// </summary>
+    /// <param name="SourcePath">The input file.</param>
+    /// <param name="OutputPath">The final muxed output.</param>
+    /// <param name="Duration">Source duration in seconds.</param>
+    /// <param name="Segments">Number of video slices.</param>
+    /// <param name="PreRollSeconds">Overlap re-decoded at the start of each slice.</param>
+    /// <param name="Encoder">Video encoder used for every slice.</param>
+    /// <param name="Preset">Encoder preset.</param>
+    /// <param name="BitrateKbps">Target video bitrate.</param>
+    /// <param name="TargetSize">Optional scale target.</param>
+    internal sealed record ParallelInterpolationPlan(
+        string SourcePath,
+        string OutputPath,
+        double Duration,
+        int Segments,
+        double PreRollSeconds,
+        string Encoder,
+        string Preset,
+        int BitrateKbps,
+        (int Width, int Height)? TargetSize);
+
+    /// <summary>
     /// One ffmpeg invocation to try.
     /// </summary>
     /// <param name="Args">The ffmpeg arguments.</param>
@@ -505,10 +598,13 @@ internal static class TranscodePlanner
     /// <param name="IsHardware">Whether the encoder runs on a GPU.</param>
     /// <param name="HardwareDecode">Whether the input is decoded on the GPU as well.</param>
     /// <param name="Label">Human readable name used in logs and the UI.</param>
+    /// <param name="ParallelPlan">Present when the attempt is a segmented interpolation pipeline
+    /// driven by the controller instead of a single ffmpeg process.</param>
     internal sealed record Attempt(
         List<string> Args,
         string Encoder,
         bool IsHardware,
         bool HardwareDecode,
-        string Label);
+        string Label,
+        ParallelInterpolationPlan? ParallelPlan = null);
 }

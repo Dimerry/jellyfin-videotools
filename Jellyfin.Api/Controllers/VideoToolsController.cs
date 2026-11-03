@@ -1031,7 +1031,8 @@ public class VideoToolsController : BaseJellyfinApiController
             NominalFrameRate = probe.NominalFrameRate,
             SubtitleIndexes = probe.SubtitleIndexes ?? Array.Empty<int>(),
             FfmpegPath = ffmpegPath,
-            Interpolate = interpolate
+            Interpolate = interpolate,
+            Duration = probe.Duration > 0 ? probe.Duration : 0
         });
 
         _logger.LogInformation(
@@ -1784,7 +1785,15 @@ public class VideoToolsController : BaseJellyfinApiController
                 job.Encoder = attempt.Encoder;
                 job.EncoderKind = attempt.IsHardware ? "Hardware" : "Software";
 
-                exitCode = await RunProcessAsync(work, attempt.Args, job, errorLines).ConfigureAwait(false);
+                if (attempt.ParallelPlan is { } plan)
+                {
+                    exitCode = await RunParallelInterpolationAsync(work, plan, job, errorLines).ConfigureAwait(false);
+                }
+                else
+                {
+                    exitCode = await RunProcessAsync(work, attempt.Args, job, errorLines).ConfigureAwait(false);
+                }
+
                 if (exitCode == 0 && System.IO.File.Exists(job.WorkPath))
                 {
                     if (attempt.IsHardware)
@@ -1871,6 +1880,340 @@ public class VideoToolsController : BaseJellyfinApiController
                     _reservedPaths.Remove(job.WorkPath);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Runs the segmented interpolation pipeline: one audio extract, N concurrently encoded video
+    /// slices (each with a pre-roll for motion context), then concat and mux. Progress maps the
+    /// slowest running slice onto the job. Any failure returns non-zero so the caller falls back
+    /// to the next attempt in the plan (the single-pass chain).
+    /// </summary>
+    /// <param name="work">The job work item.</param>
+    /// <param name="plan">The segment geometry and encoder settings.</param>
+    /// <param name="job">The job being updated.</param>
+    /// <param name="errorLines">Collector for the last ffmpeg error lines.</param>
+    /// <returns>Zero on success, non-zero when the next attempt should take over.</returns>
+    private static async Task<int> RunParallelInterpolationAsync(
+        JobWork work,
+        TranscodePlanner.ParallelInterpolationPlan plan,
+        VideoToolJobDto job,
+        LinkedList<string> errorLines)
+    {
+        var ffmpegPath = work.EncoderPath;
+        var workDir = job.WorkPath + ".interp";
+        var audioPath = Path.Combine(workDir, "audio.m4a");
+        var segmentPaths = new string[plan.Segments];
+
+        try
+        {
+            System.IO.Directory.CreateDirectory(workDir);
+
+            // Segment boundaries: N slices of equal nominal length. Slice i covers
+            // [i*len - preRoll, (i+1)*len); the trim filter cuts the pre-roll back off
+            // after interpolation so the concat is seamless. Trim windows are relative
+            // to the seeked timeline (-ss resets timestamps to zero); the last slice
+            // keeps everything to EOF so rounding cannot drop trailing frames.
+            var nominal = plan.Duration / plan.Segments;
+            var progressSlots = new double[plan.Segments];
+            var videoTasks = new Task<bool>[plan.Segments];
+            for (var i = 0; i < plan.Segments; i++)
+            {
+                var index = i;
+                segmentPaths[i] = Path.Combine(workDir, "seg" + i.ToString("00", CultureInfo.InvariantCulture) + ".mp4");
+                var seekStart = Math.Max(0, i * nominal - plan.PreRollSeconds);
+                var trimStart = Math.Max(0, i * nominal - seekStart);
+                var trimEnd = i == plan.Segments - 1
+                    ? plan.Duration + plan.PreRollSeconds + nominal
+                    : trimStart + nominal;
+                videoTasks[i] = Task.Run(() => RunSegment(
+                    ffmpegPath, plan, job, errorLines, index, seekStart, trimStart, trimEnd, segmentPaths[index], progressSlots));
+            }
+
+            // Audio is tiny next to the video slices; run it alongside them.
+            var audioArgs = new List<string>
+            {
+                "-hide_banner", "-nostdin", "-y",
+                "-i", plan.SourcePath,
+                "-vn", "-c:a", "aac", "-b:a", "192k",
+                audioPath
+            };
+            var audioTask = Task.Run(async () =>
+            {
+                var code = await RunBareProcessAsync(work, audioArgs, errorLines).ConfigureAwait(false);
+                return code == 0 && System.IO.File.Exists(audioPath);
+            });
+
+            await Task.WhenAll(videoTasks).ConfigureAwait(false);
+            var audioOk = await audioTask.ConfigureAwait(false);
+
+            if (videoTasks.Any(t => !t.Result) || (!audioOk && HasAudioStream(plan.SourcePath, ffmpegPath)))
+            {
+                work.Logger.LogWarning(
+                    "Video tool job {JobId}: segmented interpolation failed on at least one slice, falling back to a single pass",
+                    job.Id);
+                return 1;
+            }
+
+            // Concat: the slices are already encoded with identical parameters, so the
+            // concat demuxer streams them together without re-encoding.
+            var listPath = Path.Combine(workDir, "list.txt");
+            var lines = segmentPaths
+                .Where(System.IO.File.Exists)
+                .Select(p => "file '" + p.Replace("'", "'\\''", StringComparison.Ordinal) + "'");
+            await System.IO.File.WriteAllLinesAsync(listPath, lines).ConfigureAwait(false);
+
+            var muxArgs = new List<string>
+            {
+                "-hide_banner", "-nostdin", "-y",
+                "-f", "concat", "-safe", "0", "-i", listPath
+            };
+            if (System.IO.File.Exists(audioPath))
+            {
+                muxArgs.AddRange(["-i", audioPath]);
+            }
+
+            muxArgs.AddRange(
+            [
+                "-map", "0:v:0",
+                "-map", System.IO.File.Exists(audioPath) ? "1:a:0" : "0:a:0?",
+                "-c", "copy",
+                "-movflags", "+faststart",
+                job.WorkPath
+            ]);
+
+            var muxCode = await RunBareProcessAsync(work, muxArgs, errorLines).ConfigureAwait(false);
+            if (muxCode != 0 || !System.IO.File.Exists(job.WorkPath) || new FileInfo(job.WorkPath).Length == 0)
+            {
+                return muxCode == 0 ? 1 : muxCode;
+            }
+
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            work.Logger.LogError(ex, "Video tool job {JobId}: segmented interpolation pipeline threw", job.Id);
+            lock (errorLines)
+            {
+                errorLines.AddLast("segmented interpolation: " + ex.Message);
+            }
+
+            return 1;
+        }
+        finally
+        {
+            try
+            {
+                if (System.IO.Directory.Exists(workDir))
+                {
+                    System.IO.Directory.Delete(workDir, recursive: true);
+                }
+            }
+            catch
+            {
+                // Cleanup is best effort; a retry uses a fresh work path anyway.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Encodes one interpolation segment. Per-segment progress lands in <paramref name="progressSlots"/>
+    /// and is aggregated onto the job; errors land in the shared collector.
+    /// </summary>
+    /// <returns><c>true</c> when the slice file exists and is non-empty.</returns>
+    private static bool RunSegment(
+        string ffmpegPath,
+        TranscodePlanner.ParallelInterpolationPlan plan,
+        VideoToolJobDto job,
+        LinkedList<string> errorLines,
+        int index,
+        double seekStart,
+        double trimStart,
+        double trimEnd,
+        string outputPath,
+        double[] progressSlots)
+    {
+        try
+        {
+            var filters = new List<string>();
+            if (plan.TargetSize is { } size)
+            {
+                filters.Add("scale=" + size.Width + ":" + size.Height);
+            }
+
+            filters.Add("minterpolate=fps=30:mi_mode=mci:me_mode=bidir:mc_mode=aobmc:vsbmc=1");
+
+            // The first setpts normalizes the seeked timeline to zero (input -ss already does,
+            // this guards against containers with broken timestamps); trim then cuts the
+            // pre-roll and the slice tail on that normalized timeline.
+            var args = new List<string>
+            {
+                "-hide_banner", "-nostdin", "-y",
+                "-ss", seekStart.ToString("0.###", CultureInfo.InvariantCulture),
+                "-i", plan.SourcePath,
+                "-vf", "setpts=PTS-STARTPTS"
+                    + ",trim=start=" + trimStart.ToString("0.###", CultureInfo.InvariantCulture)
+                    + ":end=" + trimEnd.ToString("0.###", CultureInfo.InvariantCulture)
+                    + ",setpts=PTS-STARTPTS,"
+                    + string.Join(",", filters),
+                "-map", "0:v:0",
+                "-an", "-sn", "-dn",
+                "-c:v", plan.Encoder,
+                "-preset", plan.Preset,
+                "-b:v", plan.BitrateKbps.ToString(CultureInfo.InvariantCulture) + "k",
+                "-r", "30",
+                "-movflags", "+faststart",
+                outputPath
+            };
+
+            var startInfo = new ProcessStartInfo(ffmpegPath)
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            foreach (var arg in args)
+            {
+                startInfo.ArgumentList.Add(arg);
+            }
+
+            using var process = new Process { StartInfo = startInfo };
+            process.Start();
+
+            var segmentSpan = trimEnd - trimStart;
+            string? line;
+            while ((line = process.StandardError.ReadLine()) is not null)
+            {
+                lock (errorLines)
+                {
+                    errorLines.AddLast(line);
+                    while (errorLines.Count > 40)
+                    {
+                        errorLines.RemoveFirst();
+                    }
+                }
+
+                var timeIndex = line.IndexOf("time=", StringComparison.Ordinal);
+                if (timeIndex >= 0 && segmentSpan > 0)
+                {
+                    var value = line.AsSpan(timeIndex + 5).Trim();
+                    var spaceIndex = value.IndexOf(' ');
+                    if (spaceIndex > 0)
+                    {
+                        value = value[..spaceIndex];
+                    }
+
+                    if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out var elapsed))
+                    {
+                        progressSlots[index] = Math.Clamp(elapsed.TotalSeconds / segmentSpan, 0, 1);
+                        job.Progress = Math.Clamp(95.0 * progressSlots.Sum() / progressSlots.Length, 0, 95);
+                    }
+                }
+
+                if (job.CancelRequested && !process.HasExited)
+                {
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch
+                    {
+                        // Already gone.
+                    }
+                }
+            }
+
+            process.WaitForExit();
+            if (process.ExitCode != 0)
+            {
+                return false;
+            }
+
+            return System.IO.File.Exists(outputPath) && new FileInfo(outputPath).Length > 0;
+        }
+        catch (Exception ex)
+        {
+            lock (errorLines)
+            {
+                errorLines.AddLast("segment " + index.ToString(CultureInfo.InvariantCulture) + ": " + ex.Message);
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Runs a short-lived ffmpeg process without progress reporting (audio extract, mux). Errors
+    /// land in the shared collector.
+    /// </summary>
+    /// <returns>The process exit code.</returns>
+    private static async Task<int> RunBareProcessAsync(
+        JobWork work,
+        List<string> args,
+        LinkedList<string> errorLines)
+    {
+        var startInfo = new ProcessStartInfo(work.EncoderPath)
+        {
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var arg in args)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        using var process = new Process { StartInfo = startInfo };
+        process.Start();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync().ConfigureAwait(false);
+        var stderr = await stderrTask.ConfigureAwait(false);
+        if (process.ExitCode != 0)
+        {
+            lock (errorLines)
+            {
+                errorLines.AddLast(stderr.Trim());
+                while (errorLines.Count > 40)
+                {
+                    errorLines.RemoveFirst();
+                }
+            }
+        }
+
+        return process.ExitCode;
+    }
+
+    /// <summary>
+    /// Cheap check whether the source carries an audio stream at all.
+    /// </summary>
+    /// <returns><c>true</c> when an audio stream is declared.</returns>
+    private static bool HasAudioStream(string sourcePath, string ffprobePath)
+    {
+        try
+        {
+            var probe = ffprobePath.Replace("ffmpeg", "ffprobe", StringComparison.OrdinalIgnoreCase);
+            using var process = Process.Start(new ProcessStartInfo(probe)
+            {
+                ArgumentList = { "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", sourcePath },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+            if (process is null)
+            {
+                return false;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            return process.ExitCode == 0 && output.Trim().Length > 0;
+        }
+        catch
+        {
+            return false;
         }
     }
 
