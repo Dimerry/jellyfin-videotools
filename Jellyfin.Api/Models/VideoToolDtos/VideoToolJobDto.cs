@@ -150,6 +150,31 @@ public sealed class VideoToolJobDto
     public int CutRotation { get; set; }
 
     /// <summary>
+    /// Gets or sets the percent of the width removed from the left edge by a cut job. Not exposed over the API.
+    /// </summary>
+    [JsonIgnore]
+    public double CutCropLeftPercent { get; set; }
+
+    /// <summary>
+    /// Gets or sets the percent of the width removed from the right edge by a cut job. Not exposed over the API.
+    /// </summary>
+    [JsonIgnore]
+    public double CutCropRightPercent { get; set; }
+
+    /// <summary>
+    /// Gets or sets the source video width in pixels, used to turn crop percents into pixels.
+    /// Not exposed over the API.
+    /// </summary>
+    [JsonIgnore]
+    public int SourceWidth { get; set; }
+
+    /// <summary>
+    /// Gets or sets the source video height in pixels. Not exposed over the API.
+    /// </summary>
+    [JsonIgnore]
+    public int SourceHeight { get; set; }
+
+    /// <summary>
     /// Gets or sets the ffmpeg process id. Not exposed over the API.
     /// </summary>
     [JsonIgnore]

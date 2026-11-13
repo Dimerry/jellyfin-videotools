@@ -93,10 +93,11 @@ internal static class TranscodePlanner
         foreach (var (encoder, label) in GetCandidates(isAv1))
         {
             var isHardware = IsHardwareEncoder(encoder);
+            var needsCpuFrames = !string.IsNullOrWhiteSpace(request.VideoFilter);
 
             // Motion interpolation needs the frames on the CPU: QSV/CUDA decoders output GPU
             // surfaces the minterpolate filter cannot read, so interpolation forces software decode.
-            if (isHardware && interpolate)
+            if ((isHardware && interpolate) || (isHardware && needsCpuFrames))
             {
                 // Fall through to the software-decoded variant below; the hardware *encoder* is kept.
             }
@@ -329,12 +330,28 @@ internal static class TranscodePlanner
                 break;
         }
 
+        if (request.Trim is { } trim)
+        {
+            args.Add("-ss");
+            args.Add(trim.StartSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+        }
+
         args.Add("-i");
         args.Add(request.SourcePath);
 
+        if (request.Trim is not null)
+        {
+            args.Add("-t");
+            args.Add(request.Trim.KeepSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+        }
+
         var targetSize = GetTargetSize(request);
+
+        // A crop changes the frame size, so it is the only video filter a cropped cut uses: a
+        // target-size scale would rescale the cropped frame back up and undo the intent.
+        var cropFilter = request.VideoFilter is { Length: > 0 } extraFilter ? extraFilter : null;
         var filters = new List<string>();
-        if (targetSize is { } size)
+        if (cropFilter is null && targetSize is { } size)
         {
             filters.Add(decode switch
             {
@@ -342,6 +359,11 @@ internal static class TranscodePlanner
                 DecodeMode.Cuda => string.Create(CultureInfo.InvariantCulture, $"scale_cuda={size.Width}:{size.Height}"),
                 _ => string.Create(CultureInfo.InvariantCulture, $"scale={size.Width}:{size.Height}")
             });
+        }
+
+        if (cropFilter is not null)
+        {
+            filters.Add(cropFilter);
         }
 
         if (interpolate)
@@ -567,7 +589,27 @@ internal static class TranscodePlanner
         /// Only honored when the measured rate is plausible and below the floor.
         /// </summary>
         public bool Interpolate { get; init; }
+
+        /// <summary>
+        /// Gets an extra video filter that needs CPU frames (for example a crop used by a cut job).
+        /// When set, hardware decoding is skipped and <see cref="Trim"/> is applied to the input.
+        /// </summary>
+        public string? VideoFilter { get; init; }
+
+        /// <summary>
+        /// Gets the input trim (seek position and kept duration) applied before decoding.
+        /// </summary>
+        public TrimRequest? Trim { get; init; }
     }
+
+    /// <summary>
+    /// Describes an input-side trim: seek to <paramref name="StartSeconds"/> and keep
+    /// <paramref name="KeepSeconds"/>, with an optional display rotation.
+    /// </summary>
+    /// <param name="StartSeconds">The seek position.</param>
+    /// <param name="KeepSeconds">The kept duration.</param>
+    /// <param name="Rotation">Counter-clockwise rotation in degrees.</param>
+    internal sealed record TrimRequest(double StartSeconds, double KeepSeconds, int Rotation);
 
     /// <summary>
     /// Geometry of a segmented interpolation job: the controller splits the source into this many

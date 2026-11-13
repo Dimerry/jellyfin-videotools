@@ -180,13 +180,17 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="startSeconds">Seconds to remove from the start.</param>
     /// <param name="endSeconds">Seconds to remove from the end.</param>
     /// <param name="rotation">Counter-clockwise rotation in degrees (0, 90, 180 or 270).</param>
+    /// <param name="cropLeft">Percent of the source width to remove from the left edge (0-100).</param>
+    /// <param name="cropRight">Percent of the source width to remove from the right edge (0-100).</param>
     /// <returns>The created job.</returns>
     [HttpPost("{itemId}/Cut")]
     public ActionResult<VideoToolJobDto> StartCut(
         [FromRoute] Guid itemId,
         [FromQuery] double startSeconds = 0,
         [FromQuery] double endSeconds = 0,
-        [FromQuery] int rotation = 0)
+        [FromQuery] int rotation = 0,
+        [FromQuery] double cropLeft = 0,
+        [FromQuery] double cropRight = 0)
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -227,17 +231,29 @@ public class VideoToolsController : BaseJellyfinApiController
             return BadRequest("Rotation must be 0, 90, 180 or 270 degrees.");
         }
 
+        if (!TryNormalizeCrop(cropLeft, cropRight, out cropLeft, out cropRight, out var cropError))
+        {
+            return BadRequest(cropError);
+        }
+
+        if (cropLeft + cropRight > 0 && !HasVideoDimensions(probe.Width, probe.Height))
+        {
+            return BadRequest("Could not read the source video dimensions needed for cropping.");
+        }
+
         var keepSeconds = duration - startSeconds - endSeconds;
         var paths = CreateCutPaths(sourcePath);
-
-        var args = BuildCutArgs(sourcePath, paths.WorkPath, startSeconds, keepSeconds, rotation);
 
         var job = CreateJob("Cut", item.Id, item.Name, paths.FinalPath, sourcePath, duration);
         job.WorkPath = paths.WorkPath;
         job.CutStartSeconds = startSeconds;
         job.CutEndSeconds = endSeconds;
         job.CutRotation = rotation;
-        StartJob(job, args);
+        job.CutCropLeftPercent = cropLeft;
+        job.CutCropRightPercent = cropRight;
+        job.SourceWidth = probe.Width;
+        job.SourceHeight = probe.Height;
+        StartJob(job, BuildCutPlan(job, probe));
         return Accepted(job);
     }
 
@@ -352,7 +368,11 @@ public class VideoToolsController : BaseJellyfinApiController
                 job.CutStartSeconds = startSeconds;
                 job.CutEndSeconds = endSeconds;
                 job.CutRotation = failedJob.CutRotation;
-                StartJob(job, BuildCutArgs(failedJob.SourcePath, paths.WorkPath, startSeconds, keepSeconds, failedJob.CutRotation));
+                job.CutCropLeftPercent = failedJob.CutCropLeftPercent;
+                job.CutCropRightPercent = failedJob.CutCropRightPercent;
+                job.SourceWidth = failedJob.SourceWidth;
+                job.SourceHeight = failedJob.SourceHeight;
+                StartJob(job, BuildCutPlan(job, probe));
                 return Accepted(job);
             }
         }
@@ -628,13 +648,17 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="timeSeconds">Position in the source video, in seconds.</param>
     /// <param name="maxWidth">Maximum preview width in pixels.</param>
     /// <param name="rotation">Counter-clockwise rotation to bake into the preview (0, 90, 180 or 270).</param>
+    /// <param name="cropLeft">Percent of the width removed from the left edge for the preview.</param>
+    /// <param name="cropRight">Percent of the width removed from the right edge for the preview.</param>
     /// <returns>The JPEG frame.</returns>
     [HttpGet("{itemId}/Frame")]
     public async Task<ActionResult> GetFrame(
         [FromRoute] Guid itemId,
         [FromQuery] double timeSeconds = 0,
         [FromQuery] int maxWidth = 480,
-        [FromQuery] int rotation = 0)
+        [FromQuery] int rotation = 0,
+        [FromQuery] double cropLeft = 0,
+        [FromQuery] double cropRight = 0)
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -675,12 +699,14 @@ public class VideoToolsController : BaseJellyfinApiController
         var modified = System.IO.File.GetLastWriteTimeUtc(sourcePath).Ticks;
         var cacheName = string.Format(
             CultureInfo.InvariantCulture,
-            "{0:N}_{1}_{2}_{3}_{4}.jpg",
+            "{0:N}_{1}_{2}_{3}_{4}_{5}_{6}.jpg",
             itemId,
             modified,
             maxWidth,
             rotation,
-            timeSeconds.ToString("0.###", CultureInfo.InvariantCulture).Replace('.', 'p'));
+            timeSeconds.ToString("0.###", CultureInfo.InvariantCulture).Replace('.', 'p'),
+            cropLeft.ToString("0.##", CultureInfo.InvariantCulture).Replace('.', 'p'),
+            cropRight.ToString("0.##", CultureInfo.InvariantCulture).Replace('.', 'p'));
         var cachePath = Path.Combine(FrameCacheDirectory, cacheName);
 
         if (!System.IO.File.Exists(cachePath))
@@ -690,8 +716,8 @@ public class VideoToolsController : BaseJellyfinApiController
             {
                 if (!System.IO.File.Exists(cachePath))
                 {
-                    var width = ComputePreviewWidth(sourcePath, maxWidth, rotation);
-                    var error = await RenderFrameAsync(sourcePath, timeSeconds, width, rotation, cachePath).ConfigureAwait(false);
+                    var width = ComputePreviewWidth(sourcePath, maxWidth, rotation, cropLeft, cropRight);
+                    var error = await RenderFrameAsync(sourcePath, timeSeconds, width, rotation, cachePath, cropLeft, cropRight).ConfigureAwait(false);
                     if (error is not null && timeSeconds > 0)
                     {
                         // The reported duration can be slightly longer than the last decodable frame;
@@ -699,7 +725,7 @@ public class VideoToolsController : BaseJellyfinApiController
                         foreach (var backoff in BackoffSeconds)
                         {
                             var retryTime = Math.Max(0, timeSeconds - backoff);
-                            error = await RenderFrameAsync(sourcePath, retryTime, width, rotation, cachePath).ConfigureAwait(false);
+                            error = await RenderFrameAsync(sourcePath, retryTime, width, rotation, cachePath, cropLeft, cropRight).ConfigureAwait(false);
                             if (error is null)
                             {
                                 break;
@@ -729,13 +755,19 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <summary>
     /// Picks the preview width, taking the rotation into account so a portrait preview is not upscaled.
     /// </summary>
-    private int ComputePreviewWidth(string sourcePath, int maxWidth, int rotation)
+    private int ComputePreviewWidth(string sourcePath, int maxWidth, int rotation, double cropLeft = 0, double cropRight = 0)
     {
         var probe = ProbeSource(
             sourcePath,
             string.IsNullOrWhiteSpace(_mediaEncoder.ProbePath) ? "ffprobe" : _mediaEncoder.ProbePath);
 
         var width = rotation is 90 or 270 ? probe.Height : probe.Width;
+        if (width > 0 && rotation is not (90 or 270))
+        {
+            // A cropped preview is narrower, so its natural width is the kept width.
+            width = CropKeptWidth(width, cropLeft, cropRight);
+        }
+
         if (width <= 0)
         {
             return maxWidth;
@@ -754,7 +786,9 @@ public class VideoToolsController : BaseJellyfinApiController
         double timeSeconds,
         int width,
         int rotation,
-        string outputPath)
+        string outputPath,
+        double cropLeft = 0,
+        double cropRight = 0)
     {
         var encoderPath = string.IsNullOrWhiteSpace(_mediaEncoder.EncoderPath) ? "ffmpeg" : _mediaEncoder.EncoderPath;
         var filters = new List<string>();
@@ -770,6 +804,12 @@ public class VideoToolsController : BaseJellyfinApiController
             case 270:
                 filters.Add("transpose=1");
                 break;
+        }
+
+        if (HasCrop(cropLeft, cropRight))
+        {
+            // Crop before the scale so the preview shows exactly what the cut job will keep.
+            filters.Add(BuildCropFilterExpression(cropLeft, cropRight, -1));
         }
 
         filters.Add("scale=" + width.ToString(CultureInfo.InvariantCulture) + ":-2");
@@ -963,6 +1003,230 @@ public class VideoToolsController : BaseJellyfinApiController
         return job;
     }
 
+    /// <summary>
+    /// Builds the ffmpeg run(s) for a cut job. A pure trim is a single stream copy; a crop changes the
+    /// frame size and cannot be stream-copied, so it is re-encoded with the same hardware/software
+    /// fallback chain a transcode uses (hardware decode fails on the crop filter, which is expected).
+    /// </summary>
+    /// <param name="job">The cut job.</param>
+    /// <param name="probe">The probed source, used to size the crop and the re-encode.</param>
+    /// <returns>The attempts to run in order.</returns>
+    private IReadOnlyList<TranscodePlanner.Attempt> BuildCutPlan(VideoToolJobDto job, MediaProbe probe)
+    {
+        var keepSeconds = job.SourceDurationSeconds - job.CutStartSeconds - job.CutEndSeconds;
+        if (!HasCrop(job.CutCropLeftPercent, job.CutCropRightPercent))
+        {
+            return new List<TranscodePlanner.Attempt>
+            {
+                new(BuildCutArgs(job.SourcePath, job.WorkPath, job.CutStartSeconds, keepSeconds, job.CutRotation), "copy", false, false, "Stream copy")
+            };
+        }
+
+        var ffmpegPath = string.IsNullOrWhiteSpace(_mediaEncoder.EncoderPath) ? "ffmpeg" : _mediaEncoder.EncoderPath;
+        var cascade = TranscodePlanner.Build(new TranscodePlanner.Request
+        {
+            // Same encoder cascade as the default transcode, but the format, bitrate and resolution
+            // are kept as close to the source as the cascade allows rather than forcing a 1080p H.265.
+            SourcePath = job.SourcePath,
+            OutputPath = job.WorkPath,
+            Codec = "h265",
+            BitrateKbps = Math.Max(3000, (int)Math.Round(EstimateReencodeBitrate(probe, job))),
+            // Leave headroom to the encoder's bitrate ceiling: hardware encoders round the frame
+            // size up to macroblock multiples, and that small overshoot must not trigger a scale.
+            MaxHeight = probe.Height > 0 ? probe.Height * 2 : 2160,
+            SourceVideoCodec = probe.VideoCodec,
+            Width = probe.Width,
+            Height = probe.Height,
+            FrameRate = probe.FrameRate,
+            NominalFrameRate = probe.NominalFrameRate,
+            SubtitleIndexes = probe.SubtitleIndexes ?? Array.Empty<int>(),
+            FfmpegPath = ffmpegPath,
+            Interpolate = false,
+            Duration = keepSeconds,
+            Trim = new TranscodePlanner.TrimRequest(job.CutStartSeconds, keepSeconds, job.CutRotation),
+            VideoFilter = BuildCropFilter(job)
+        });
+
+        // Video must be re-encoded, so only the audio/other streams are copied; swapping the whole
+        // stream map for -map 0 -c copy would silently defeat the crop filter.
+        var attempts = new List<TranscodePlanner.Attempt>(cascade.Count);
+        foreach (var attempt in cascade)
+        {
+            attempts.Add(EnsureAudioCopyAttempt(attempt));
+        }
+
+        _logger.LogInformation(
+            "Video tool crop plan for {SourcePath}: crop {Left}% left / {Right}% right, {Encoders}",
+            job.SourcePath,
+            job.CutCropLeftPercent,
+            job.CutCropRightPercent,
+            string.Join(" -> ", cascade.Select(attempt => attempt.Encoder)));
+
+        return attempts;
+    }
+
+    /// <summary>
+    /// Rewrites a transcode attempt so its audio tracks are copied instead of re-encoded, keeping
+    /// the original audio quality when only the video is re-encoded for a crop.
+    /// </summary>
+    /// <param name="attempt">The planned transcode attempt.</param>
+    /// <returns>The attempt with copied audio.</returns>
+    private static TranscodePlanner.Attempt EnsureAudioCopyAttempt(TranscodePlanner.Attempt attempt)
+        => attempt with { Args = EnsureAudioCopy(attempt.Args) };
+
+    /// <summary>
+    /// Adds an explicit audio/picture copy to a transcode attempt so the re-encoded video keeps the
+    /// original audio tracks unchanged.
+    /// </summary>
+    /// <param name="args">The transcode argument list.</param>
+    /// <returns>The argument list with an audio copy.</returns>
+    private static List<string> EnsureAudioCopy(List<string> args)
+    {
+        List<string> result = new(args.Count + 4);
+        for (var index = 0; index < args.Count; index++)
+        {
+            var arg = args[index];
+
+            // The planner appends "-c:a aac -b:a 192k" after the video encoder, which overrides any
+            // earlier audio setting. Drop that pair and put a copy in its place, otherwise the
+            // audio is re-encoded (and a copy followed by aac is simply ambiguous to ffmpeg).
+            if (arg == "-c:a" && index + 1 < args.Count)
+            {
+                index += 1;
+                if (index + 3 < args.Count && args[index + 1] == "-b:a")
+                {
+                    index += 3;
+                }
+
+                if (!result.Contains("-c:a"))
+                {
+                    result.Add("-c:a");
+                    result.Add("copy");
+                }
+
+                continue;
+            }
+
+            result.Add(arg);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Builds the crop filter applied to the kept part of the video.
+    /// </summary>
+    /// <param name="job">The cut job.</param>
+    /// <returns>The filter expression.</returns>
+    private static string BuildCropFilter(VideoToolJobDto job)
+    {
+        var width = job.SourceWidth > 0 ? job.SourceWidth : 1920;
+        return BuildCropFilterExpression(job.CutCropLeftPercent, job.CutCropRightPercent, width);
+    }
+
+    /// <summary>
+    /// Builds a crop filter from the percentages removed on each side.
+    /// </summary>
+    /// <param name="leftPercent">Percent removed from the left edge.</param>
+    /// <param name="rightPercent">Percent removed from the right edge.</param>
+    /// <param name="sourceWidth">Source width in pixels, or a non-positive value to let ffmpeg read it.</param>
+    /// <returns>The filter expression.</returns>
+    private static string BuildCropFilterExpression(double leftPercent, double rightPercent, int sourceWidth)
+    {
+        leftPercent = Math.Max(0, leftPercent);
+        rightPercent = Math.Max(0, rightPercent);
+
+        if (sourceWidth > 0)
+        {
+            var leftPx = (int)Math.Round(sourceWidth * leftPercent / 100d, MidpointRounding.AwayFromZero);
+            var keepWidth = CropKeptWidth(sourceWidth, leftPercent, rightPercent);
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "crop={0}:ih:{1}:0",
+                keepWidth,
+                leftPx);
+        }
+
+        // Unknown width: express everything relative to the decoded frame size inside ffmpeg.
+        return string.Format(
+            CultureInfo.InvariantCulture,
+            "crop=trunc(iw-(iw*{0}/100)-(iw*{1}/100)):ih:trunc(iw*{0}/100):0",
+            leftPercent.ToString("0.######", CultureInfo.InvariantCulture),
+            rightPercent.ToString("0.######", CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// Computes the width kept after cropping, rounded down to an even number because yuv420p
+    /// and the common encoders require it.
+    /// </summary>
+    private static int CropKeptWidth(int sourceWidth, double leftPercent, double rightPercent)
+    {
+        if (sourceWidth <= 0)
+        {
+            return sourceWidth;
+        }
+
+        var leftPx = (int)Math.Round(sourceWidth * Math.Max(0, leftPercent) / 100d, MidpointRounding.AwayFromZero);
+        var rightPx = (int)Math.Round(sourceWidth * Math.Max(0, rightPercent) / 100d, MidpointRounding.AwayFromZero);
+        var keepWidth = sourceWidth - leftPx - rightPx;
+        keepWidth = Math.Max(2, keepWidth);
+        return keepWidth % 2 == 0 ? keepWidth : keepWidth - 1;
+    }
+
+    /// <summary>
+    /// Validates and clamps the crop percentages. A value of zero or below means no crop.
+    /// </summary>
+    /// <param name="left">The requested left crop percent.</param>
+    /// <param name="right">The requested right crop percent.</param>
+    /// <param name="normalizedLeft">The clamped left crop percent.</param>
+    /// <param name="normalizedRight">The clamped right crop percent.</param>
+    /// <param name="error">The validation error, if any.</param>
+    /// <returns><c>true</c> when the crop values are usable.</returns>
+    private static bool TryNormalizeCrop(double left, double right, out double normalizedLeft, out double normalizedRight, out string error)
+    {
+        normalizedLeft = 0;
+        normalizedRight = 0;
+        error = string.Empty;
+
+        if (!double.IsFinite(left) || !double.IsFinite(right))
+        {
+            error = "Crop values must be finite numbers.";
+            return false;
+        }
+
+        left = Math.Max(0, left);
+        right = Math.Max(0, right);
+        if (left >= 100 || right >= 100 || left + right >= 100)
+        {
+            error = "The crop cannot remove the whole width.";
+            return false;
+        }
+
+        normalizedLeft = left;
+        normalizedRight = right;
+        return true;
+    }
+
+    private static bool HasCrop(double leftPercent, double rightPercent)
+        => leftPercent > 0 || rightPercent > 0;
+
+    private static bool HasVideoDimensions(int width, int height)
+        => width > 0 && height > 0;
+
+    /// <summary>
+    /// Estimates a re-encode bitrate that keeps the source's bitrate per pixel so a cropped
+    /// re-encode does not visibly degrade.
+    /// </summary>
+    /// <param name="probe">The probed source.</param>
+    /// <param name="job">The cut job.</param>
+    /// <returns>The target bitrate in kbps.</returns>
+    private static double EstimateReencodeBitrate(MediaProbe probe, VideoToolJobDto job)
+    {
+        var keptRatio = Math.Max(0.05, 1 - (job.CutCropLeftPercent + job.CutCropRightPercent) / 100d);
+        var sourceBitrate = probe.VideoBitrateKbps > 0 ? probe.VideoBitrateKbps : 8000;
+        return sourceBitrate * keptRatio;
+    }
+
     private static List<string> BuildCutArgs(string sourcePath, string outputPath, double startSeconds, double keepSeconds, int rotation = 0)
     {
         var args = new List<string>
@@ -1118,6 +1382,7 @@ public class VideoToolsController : BaseJellyfinApiController
             var frameRate = 0d;
             var nominalFrameRate = 0d;
             var videoCodec = string.Empty;
+            var videoBitrate = 0d;
             var subtitleIndexes = new List<int>();
             if (root.TryGetProperty("streams", out var streams))
             {
@@ -1149,6 +1414,13 @@ public class VideoToolsController : BaseJellyfinApiController
                         frameRate = ParseFrameRate(stream, "avg_frame_rate");
                         nominalFrameRate = ParseFrameRate(stream, "r_frame_rate");
                         videoCodec = GetString(stream, "codec_name") ?? string.Empty;
+                        if (stream.TryGetProperty("bit_rate", out var bitRateElement)
+                            && double.TryParse(bitRateElement.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedBitRate)
+                            && parsedBitRate > 0)
+                        {
+                            // ffprobe reports bits per second; the planner works in kbps.
+                            videoBitrate = parsedBitRate / 1000d;
+                        }
                     }
                     else if (codecType == "subtitle")
                     {
@@ -1188,7 +1460,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 frameRate = InferFrameRateFromPackets(sourcePath, probePath);
             }
 
-            return new MediaProbe(duration, width, height, subtitleIndexes, frameRate, nominalFrameRate, videoCodec);
+            return new MediaProbe(duration, width, height, subtitleIndexes, frameRate, nominalFrameRate, videoCodec, videoBitrate);
         }
         catch (Exception)
         {
@@ -2355,7 +2627,8 @@ public class VideoToolsController : BaseJellyfinApiController
         IReadOnlyList<int> SubtitleIndexes,
         double FrameRate,
         double NominalFrameRate,
-        string VideoCodec);
+        string VideoCodec,
+        double VideoBitrateKbps = 0);
 
     private sealed record JobWork(
         VideoToolJobDto Job,
