@@ -4,7 +4,7 @@
 > 所有改动都在 `videotools-12.4` 分支上。
 
 **基线：上游 Jellyfin `v12.4`（2026-10-26 稳定版）。**
-本仓库版本号 `12.4.2`：**主次版本号必须跟上游一致**，只在自己迭代时递增末位。
+本仓库版本号 `12.4.3`：**主次版本号必须跟上游一致**，只在自己迭代时递增末位。
 原因：Jellyfin 客户端会把服务端版本号和功能下限做比较，写成 `0.1.0` 会被当成上古服务器，功能被降级甚至拒绝连接。
 
 一句话概括：给 Jellyfin 加了**转码 / 剪辑**、**视频和图片旋转**、**后台任务队列**、**剪辑预览抽帧**、**按文件大小、比特率排序**、**搜索词直接按扩展名命中文件**，另外补了个 **Emby 兼容层**让第三方 Emby 工具能直连。
@@ -24,10 +24,10 @@
 
 **转码**
 
-- `POST /VideoTools/{itemId}/Transcode?codec=h265|av1&bitrateKbps=3000&resolution=1080p|4k`
-  单条入队。
+- `POST /VideoTools/{itemId}/Transcode?codec=h265|av1&bitrateKbps=3000&resolution=1080p|4k&rateControl=quality|bitrate&quality=medium&encoder=auto`
+  单条入队。**不带参数调用时使用存储的转码默认设置**（控制台 → 视频工具 → 转码默认设置）；带任一参数则全部按显式值处理。
 - `POST /VideoTools/Transcode` + body `["guid","guid"]`
-  批量入队，返回 `{ Added, Skipped, Jobs[], SkippedNames[] }`；没有本地文件 / 不是视频的条目按名字回报跳过。
+  批量入队，参数同上，规则同上。
 - 编码策略（自动挑选，失败逐级回退）：
   - **H.265**：Intel QSV（`hevc_qsv`）→ NVIDIA NVENC（`hevc_nvenc`）→ 软件 `libx265`；
   - **AV1**：Intel QSV（`av1_qsv`）→ NVIDIA NVENC（`av1_nvenc`）→ 软件 `libsvtav1`（preset 8）；
@@ -37,11 +37,15 @@
   - 想强制指定：环境变量 `VIDEOTOOLS_ENCODER` = `auto`（默认）/ `qsv` / `nvenc` / `software`。
   - 音频统一 AAC 192k，文本字幕转 `mov_text`，位图字幕跳过，加 `+faststart`。
 - 分辨率默认 1080p、可选 4K，**只缩不放**（源比目标小就保持原尺寸）。
+- **码控模式可选**：默认「质量模式」按固定画质编码（码率随画面复杂度浮动，crf/qvbr/global_quality），可选「码率模式」按客户端请求的固定码率编码；质量档位最高/高/中/低/最低五档。剪辑（裁切）路径固定质量模式+高档，保证裁切后画面与源一致。
+- **编码器偏好**：转码/剪辑对话框可手动指定优先编码器（QSV / NVENC / VA-API / AMF / 软件）；指定后仍走回退链，坏了的 GPU 不会让任务无输出。控制台 → 视频工具可存「转码默认设置」和「剪辑默认设置」，从媒体库直接入队（不弹对话框）时生效。
+- **AI 插帧（可选）**：源视频低于 23fps 时对话框出现「AI 插帧至 30 帧」勾选，用 minterpolate 运动补偿插帧，观感明显更流畅但速度慢；高帧率源不显示该选项。插帧按片段并行处理，多段同时算，速度成倍提升。
 
 **剪辑**
 
-- `POST /VideoTools/{itemId}/Cut?startSeconds=2&endSeconds=3&rotation=0|90|180|270`
+- `POST /VideoTools/{itemId}/Cut?startSeconds=2&endSeconds=3&rotation=0|90|180|270&cropLeft=0&cropRight=0`
 - `-ss` 输入端 + `-c copy` 流复制，秒完成、无损。
+- **左右百分比裁切**（可选）：填 `cropLeft` / `cropRight`（0-99）按源宽度百分比从两侧裁掉画面；裁切需要重编码（自动走质量模式+高档，H.265/AV1 可选），纯剪断依然流复制。对话框里带实时裁切预览（蓝色框保留区）和裁切后宽高提示。
 - **剪辑完成后自动重抽海报**：剪辑是原地顶替文件，旧封面还停留在未剪辑的画面上，所以任务成功后从新文件重新抓一张主图（走 ProviderManager 静默刷新，不触发媒体库扫描）；转码不重抽（内容和时长不变，海报依然准）。
 - **旋转**：`rotation` 传 0 / 90 / 180 / 270（逆时针）。用 `-display_rotation`（放在 `-i` 之前）重写 display matrix，配合 `-c copy` 依然是流复制，**不重编码、秒完成**，画面无损。
   注意它是绝对设置：源文件自带旋转元数据（手机竖拍）时会被覆盖成所选角度，而不是叠加。
