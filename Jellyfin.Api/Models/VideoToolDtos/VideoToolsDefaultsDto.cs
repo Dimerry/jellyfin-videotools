@@ -58,6 +58,11 @@ public sealed class VideoToolsTranscodeDefaults
 public sealed class VideoToolsCutDefaults
 {
     /// <summary>
+    /// Gets or sets the target codec used when a crop re-encodes the picture: <c>h265</c> or <c>av1</c>.
+    /// </summary>
+    public string Codec { get; set; } = "h265";
+
+    /// <summary>
     /// Gets or sets the first encoder to try, or <c>auto</c>.
     /// </summary>
     public string Encoder { get; set; } = "auto";

@@ -106,13 +106,13 @@ public class VideoToolsController : BaseJellyfinApiController
     [HttpPost("{itemId}/Transcode")]
     public ActionResult<VideoToolJobDto> StartTranscode(
         [FromRoute] Guid itemId,
-        [FromQuery] string codec = "h265",
-        [FromQuery] int bitrateKbps = 3000,
-        [FromQuery] string resolution = "1080p",
+        [FromQuery] string? codec = null,
+        [FromQuery] int? bitrateKbps = null,
+        [FromQuery] string? resolution = null,
         [FromQuery] bool interpolate = false,
-        [FromQuery] string rateControl = "quality",
-        [FromQuery] string quality = "medium",
-        [FromQuery] string encoder = "auto")
+        [FromQuery] string? rateControl = null,
+        [FromQuery] string? quality = null,
+        [FromQuery] string? encoder = null)
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -121,12 +121,33 @@ public class VideoToolsController : BaseJellyfinApiController
         }
 
         var useQuality = !string.Equals(rateControl, "bitrate", StringComparison.OrdinalIgnoreCase);
-        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error, useQuality))
+        var qualityPreset = ParseQualityPreset(quality);
+        var encoderPreference = ParseEncoderPreference(encoder);
+
+        // A client that queues from the library without opening the dialog sends no explicit
+        // settings; in that case the stored defaults decide codec, resolution and size mode.
+        // Explicit query parameters always win over the defaults.
+        if (codec is null && resolution is null && rateControl is null)
+        {
+            var transcodeDefaults = LoadDefaults().Transcode;
+            codec = transcodeDefaults.Codec;
+            resolution = transcodeDefaults.Resolution;
+            useQuality = string.Equals(transcodeDefaults.RateControl, "quality", StringComparison.OrdinalIgnoreCase);
+            qualityPreset = ParseQualityPreset(transcodeDefaults.Quality);
+            encoderPreference = ParseEncoderPreference(transcodeDefaults.Encoder);
+            bitrateKbps ??= transcodeDefaults.BitrateKbps;
+        }
+
+        codec ??= "h265";
+        bitrateKbps ??= 3000;
+        resolution ??= "1080p";
+
+        if (!TryParseTranscodeParams(codec, bitrateKbps.Value, resolution, out var normalizedCodec, out var maxHeight, out var error, useQuality))
         {
             return BadRequest(error);
         }
 
-        var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate, useQuality, ParseQualityPreset(quality), ParseEncoderPreference(encoder));
+        var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps.Value, maxHeight, interpolate, useQuality, qualityPreset, encoderPreference);
         if (job is null)
         {
             return BadRequest("Item has no local video file.");
@@ -151,13 +172,13 @@ public class VideoToolsController : BaseJellyfinApiController
     [HttpPost("Transcode")]
     public ActionResult<TranscodeBatchResultDto> StartTranscodeBatch(
         [FromBody] Guid[] itemIds,
-        [FromQuery] string codec = "h265",
-        [FromQuery] int bitrateKbps = 3000,
-        [FromQuery] string resolution = "1080p",
+        [FromQuery] string? codec = null,
+        [FromQuery] int? bitrateKbps = null,
+        [FromQuery] string? resolution = null,
         [FromQuery] bool interpolate = false,
-        [FromQuery] string rateControl = "quality",
-        [FromQuery] string quality = "medium",
-        [FromQuery] string encoder = "auto")
+        [FromQuery] string? rateControl = null,
+        [FromQuery] string? quality = null,
+        [FromQuery] string? encoder = null)
     {
         if (itemIds is null || itemIds.Length == 0)
         {
@@ -165,7 +186,27 @@ public class VideoToolsController : BaseJellyfinApiController
         }
 
         var useQuality = !string.Equals(rateControl, "bitrate", StringComparison.OrdinalIgnoreCase);
-        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error, useQuality))
+        var qualityPreset = ParseQualityPreset(quality);
+        var encoderPreference = ParseEncoderPreference(encoder);
+
+        // Same defaults rule as the single-item endpoint: a client without explicit settings gets
+        // the stored defaults, explicit query parameters always win.
+        if (codec is null && resolution is null && rateControl is null)
+        {
+            var transcodeDefaults = LoadDefaults().Transcode;
+            codec = transcodeDefaults.Codec;
+            resolution = transcodeDefaults.Resolution;
+            useQuality = string.Equals(transcodeDefaults.RateControl, "quality", StringComparison.OrdinalIgnoreCase);
+            qualityPreset = ParseQualityPreset(transcodeDefaults.Quality);
+            encoderPreference = ParseEncoderPreference(transcodeDefaults.Encoder);
+            bitrateKbps ??= transcodeDefaults.BitrateKbps;
+        }
+
+        codec ??= "h265";
+        bitrateKbps ??= 3000;
+        resolution ??= "1080p";
+
+        if (!TryParseTranscodeParams(codec, bitrateKbps.Value, resolution, out var normalizedCodec, out var maxHeight, out var error, useQuality))
         {
             return BadRequest(error);
         }
@@ -180,7 +221,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 continue;
             }
 
-            var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate, useQuality, ParseQualityPreset(quality), ParseEncoderPreference(encoder));
+            var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps.Value, maxHeight, interpolate, useQuality, qualityPreset, encoderPreference);
             if (job is null)
             {
                 result.SkippedNames.Add(item.Name);
@@ -207,6 +248,10 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="rotation">Counter-clockwise rotation in degrees (0, 90, 180 or 270).</param>
     /// <param name="cropLeft">Percent of the source width to remove from the left edge (0-100).</param>
     /// <param name="cropRight">Percent of the source width to remove from the right edge (0-100).</param>
+    /// <param name="codec">Target codec for the re-encode a crop needs: h265 or av1; omitted means the stored cut defaults.</param>
+    /// <param name="rateControl">"quality" or "bitrate"; omitted means the stored cut defaults.</param>
+    /// <param name="quality">Quality level used in quality mode.</param>
+    /// <param name="encoder">First encoder to try; "auto" keeps the default cascade.</param>
     /// <returns>The created job.</returns>
     [HttpPost("{itemId}/Cut")]
     public ActionResult<VideoToolJobDto> StartCut(
@@ -215,7 +260,11 @@ public class VideoToolsController : BaseJellyfinApiController
         [FromQuery] double endSeconds = 0,
         [FromQuery] int rotation = 0,
         [FromQuery] double cropLeft = 0,
-        [FromQuery] double cropRight = 0)
+        [FromQuery] double cropRight = 0,
+        [FromQuery] string? codec = null,
+        [FromQuery] string? rateControl = null,
+        [FromQuery] string? quality = null,
+        [FromQuery] string? encoder = null)
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -269,6 +318,45 @@ public class VideoToolsController : BaseJellyfinApiController
         var keepSeconds = duration - startSeconds - endSeconds;
         var paths = CreateCutPaths(sourcePath);
 
+        // A crop re-encodes the picture, so its encoder and size mode come from the cut defaults
+        // unless the client sends explicit values (the plain trim path never re-encodes and
+        // therefore ignores them entirely).
+        var cutCodec = "h265";
+        var useQuality = true;
+        var qualityPreset = VideoQualityPresets.high;
+        var encoderPreference = VideoEncoderPreference.auto;
+        if (HasCrop(cropLeft, cropRight))
+        {
+            var cutDefaults = LoadDefaults().Cut;
+            cutCodec = cutDefaults.Codec;
+            useQuality = !string.Equals(cutDefaults.RateControl, "bitrate", StringComparison.OrdinalIgnoreCase);
+            qualityPreset = ParseQualityPreset(cutDefaults.Quality);
+            encoderPreference = ParseEncoderPreference(cutDefaults.Encoder);
+
+            if (codec is not null)
+            {
+                cutCodec = codec;
+            }
+
+            if (rateControl is not null)
+            {
+                useQuality = !string.Equals(rateControl, "bitrate", StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (quality is not null)
+            {
+                qualityPreset = ParseQualityPreset(quality);
+            }
+
+            if (encoder is not null)
+            {
+                encoderPreference = ParseEncoderPreference(encoder);
+            }
+
+            // The cut pipeline only offers the two library codecs; anything else falls back to h265.
+            cutCodec = string.Equals(cutCodec, "av1", StringComparison.OrdinalIgnoreCase) ? "av1" : "h265";
+        }
+
         var job = CreateJob("Cut", item.Id, item.Name, paths.FinalPath, sourcePath, duration);
         job.WorkPath = paths.WorkPath;
         job.CutStartSeconds = startSeconds;
@@ -278,7 +366,12 @@ public class VideoToolsController : BaseJellyfinApiController
         job.CutCropRightPercent = cropRight;
         job.SourceWidth = probe.Width;
         job.SourceHeight = probe.Height;
-        StartJob(job, BuildCutPlan(job, probe));
+        if (HasCrop(cropLeft, cropRight))
+        {
+            job.Codec = string.Equals(cutCodec, "av1", StringComparison.OrdinalIgnoreCase) ? "AV1" : "H.265";
+        }
+
+        StartJob(job, BuildCutPlan(job, probe, cutCodec, useQuality, qualityPreset, encoderPreference));
         return Accepted(job);
     }
 
@@ -423,7 +516,28 @@ public class VideoToolsController : BaseJellyfinApiController
                 job.CutCropRightPercent = failedJob.CutCropRightPercent;
                 job.SourceWidth = failedJob.SourceWidth;
                 job.SourceHeight = failedJob.SourceHeight;
-                StartJob(job, BuildCutPlan(job, probe));
+
+                // The original encoder settings are not persisted on the job; re-planning from the
+                // stored cut defaults keeps a retried crop consistent with new crops.
+                if (HasCrop(failedJob.CutCropLeftPercent, failedJob.CutCropRightPercent))
+                {
+                    var cutDefaults = LoadDefaults().Cut;
+                    job.Codec = string.Equals(cutDefaults.Codec, "av1", StringComparison.OrdinalIgnoreCase) ? "AV1" : "H.265";
+                    StartJob(
+                        job,
+                        BuildCutPlan(
+                            job,
+                            probe,
+                            cutDefaults.Codec,
+                            !string.Equals(cutDefaults.RateControl, "bitrate", StringComparison.OrdinalIgnoreCase),
+                            ParseQualityPreset(cutDefaults.Quality),
+                            ParseEncoderPreference(cutDefaults.Encoder)));
+                }
+                else
+                {
+                    StartJob(job, BuildCutPlan(job, probe));
+                }
+
                 return Accepted(job);
             }
         }
@@ -1086,8 +1200,18 @@ public class VideoToolsController : BaseJellyfinApiController
     /// </summary>
     /// <param name="job">The cut job.</param>
     /// <param name="probe">The probed source, used to size the crop and the re-encode.</param>
+    /// <param name="codec">Target codec for the re-encode: h265 or av1.</param>
+    /// <param name="useQuality">Whether to encode to a quality level instead of a bitrate.</param>
+    /// <param name="qualityPreset">The quality level used when <paramref name="useQuality"/> is set.</param>
+    /// <param name="preferredEncoder">The encoder to try first, or <see cref="VideoEncoderPreference.auto"/>.</param>
     /// <returns>The attempts to run in order.</returns>
-    private IReadOnlyList<TranscodePlanner.Attempt> BuildCutPlan(VideoToolJobDto job, MediaProbe probe)
+    private IReadOnlyList<TranscodePlanner.Attempt> BuildCutPlan(
+        VideoToolJobDto job,
+        MediaProbe probe,
+        string codec = "h265",
+        bool useQuality = true,
+        VideoQualityPresets qualityPreset = VideoQualityPresets.high,
+        VideoEncoderPreference preferredEncoder = VideoEncoderPreference.auto)
     {
         var keepSeconds = job.SourceDurationSeconds - job.CutStartSeconds - job.CutEndSeconds;
         if (!HasCrop(job.CutCropLeftPercent, job.CutCropRightPercent))
@@ -1105,14 +1229,15 @@ public class VideoToolsController : BaseJellyfinApiController
             // are kept as close to the source as the cascade allows rather than forcing a 1080p H.265.
             SourcePath = job.SourcePath,
             OutputPath = job.WorkPath,
-            Codec = "h265",
+            Codec = codec,
             BitrateKbps = Math.Max(3000, (int)Math.Round(EstimateReencodeBitrate(probe, job))),
 
             // Cropping re-encodes the picture, so quality mode keeps the crop visually identical to
             // the source instead of squeezing it into a guessed bitrate. Bitrate mode is still
             // available on the transcode dialog for people who want a fixed size.
-            UseQuality = true,
-            QualityPreset = VideoQualityPresets.high,
+            UseQuality = useQuality,
+            QualityPreset = qualityPreset,
+            PreferredEncoder = preferredEncoder,
             // Leave headroom to the encoder's bitrate ceiling: hardware encoders round the frame
             // size up to macroblock multiples, and that small overshoot must not trigger a scale.
             MaxHeight = probe.Height > 0 ? probe.Height * 2 : 2160,
@@ -1728,6 +1853,7 @@ public class VideoToolsController : BaseJellyfinApiController
         transcode.Quality = NormalizeQuality(transcode.Quality, "medium");
         transcode.BitrateKbps = Math.Clamp(transcode.BitrateKbps, 100, 200000);
 
+        cut.Codec = string.Equals(cut.Codec, "av1", StringComparison.OrdinalIgnoreCase) ? "av1" : "h265";
         cut.Encoder = string.IsNullOrWhiteSpace(cut.Encoder) ? "auto" : cut.Encoder.Trim().ToLowerInvariant();
         cut.RateControl = string.Equals(cut.RateControl, "bitrate", StringComparison.OrdinalIgnoreCase) ? "bitrate" : "quality";
         cut.Quality = NormalizeQuality(cut.Quality, "high");
