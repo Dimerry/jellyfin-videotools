@@ -43,6 +43,9 @@ public class EncodingOptions
         VppTonemappingContrast = 1;
         H264Crf = 23;
         H265Crf = 28;
+        HardwareEncoder = VideoEncoderPreference.auto;
+        VideoRateControlMode = VideoRateControlModes.bitrate;
+        VideoQualityPreset = VideoQualityPresets.medium;
         EncoderPreset = EncoderPreset.auto;
         DeinterlaceDoubleRate = false;
         DeinterlaceMethod = DeinterlaceMethod.yadif;
@@ -214,6 +217,28 @@ public class EncodingOptions
     /// Gets or sets the H265 CRF.
     /// </summary>
     public int H265Crf { get; set; }
+
+    /// <summary>
+    /// Gets or sets the explicit hardware/software encoder to use (e.g. <c>hevc_qsv</c>).
+    /// <see cref="VideoEncoderPreference.auto"/> keeps the classic behaviour: try the encoder of the
+    /// configured <see cref="HardwareAccelerationType"/>, then fall back to software encoding.
+    /// When a specific encoder is selected and it fails, the next hardware encoder this machine
+    /// supports is tried before falling back to the software encoder.
+    /// </summary>
+    public VideoEncoderPreference HardwareEncoder { get; set; }
+
+    /// <summary>
+    /// Gets or sets how the video encoder picks the output size: a target bitrate
+    /// (the historic behaviour, driven by the client quality setting) or a quality level,
+    /// where the encoder spends the bitrate it needs for the requested quality.
+    /// </summary>
+    public VideoRateControlModes VideoRateControlMode { get; set; }
+
+    /// <summary>
+    /// Gets or sets the quality level used when <see cref="VideoRateControlMode"/> is
+    /// <see cref="VideoRateControlModes.quality"/>.
+    /// </summary>
+    public VideoQualityPresets VideoQualityPreset { get; set; }
 
     /// <summary>
     /// Gets or sets the encoder preset.

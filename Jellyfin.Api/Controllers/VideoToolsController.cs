@@ -11,10 +11,12 @@ using System.Threading.Tasks;
 using Jellyfin.Api.Helpers;
 using Jellyfin.Api.Models.VideoToolDtos;
 using MediaBrowser.Common.Api;
+using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -43,6 +45,11 @@ public class VideoToolsController : BaseJellyfinApiController
     private static readonly string FrameCacheDirectory = Path.Combine(Path.GetTempPath(), "jellyfin-videotools-frames");
     private static readonly SemaphoreSlim _frameLock = new(2, 2);
     private static readonly double[] BackoffSeconds = [0.5, 1.0, 2.0, 5.0];
+    private static readonly JsonSerializerOptions DefaultsJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = true
+    };
     private static CancellationTokenSource? _scanCts;
     private static bool _workerStarted;
 
@@ -51,6 +58,7 @@ public class VideoToolsController : BaseJellyfinApiController
     private readonly IMediaEncoder _mediaEncoder;
     private readonly IProviderManager _providerManager;
     private readonly IDirectoryService _directoryService;
+    private readonly IServerConfigurationManager _serverConfigurationManager;
     private readonly ILogger<VideoToolsController> _logger;
 
     /// <summary>
@@ -61,6 +69,7 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
     /// <param name="providerManager">Instance of the <see cref="IProviderManager"/> interface.</param>
     /// <param name="directoryService">Instance of the <see cref="IDirectoryService"/> interface.</param>
+    /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
     /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
     public VideoToolsController(
         ILibraryManager libraryManager,
@@ -68,6 +77,7 @@ public class VideoToolsController : BaseJellyfinApiController
         IMediaEncoder mediaEncoder,
         IProviderManager providerManager,
         IDirectoryService directoryService,
+        IServerConfigurationManager serverConfigurationManager,
         ILogger<VideoToolsController> logger)
     {
         _libraryManager = libraryManager;
@@ -75,6 +85,7 @@ public class VideoToolsController : BaseJellyfinApiController
         _mediaEncoder = mediaEncoder;
         _providerManager = providerManager;
         _directoryService = directoryService;
+        _serverConfigurationManager = serverConfigurationManager;
         _logger = logger;
     }
 
@@ -88,6 +99,9 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="bitrateKbps">Target video bitrate in kbps.</param>
     /// <param name="resolution">Maximum output resolution: 1080p (default) or 4k. Sources smaller than the limit are not upscaled.</param>
     /// <param name="interpolate">When true, sources below 23 fps are motion-interpolated to 30 fps.</param>
+    /// <param name="rateControl">"quality" (default) or "bitrate": encode to a quality level or to <paramref name="bitrateKbps"/>.</param>
+    /// <param name="quality">Quality level used in quality mode: highest, high, medium, low or lowest.</param>
+    /// <param name="encoder">First encoder to try, e.g. h265_qsv; "auto" keeps the default cascade.</param>
     /// <returns>The created job.</returns>
     [HttpPost("{itemId}/Transcode")]
     public ActionResult<VideoToolJobDto> StartTranscode(
@@ -95,7 +109,10 @@ public class VideoToolsController : BaseJellyfinApiController
         [FromQuery] string codec = "h265",
         [FromQuery] int bitrateKbps = 3000,
         [FromQuery] string resolution = "1080p",
-        [FromQuery] bool interpolate = false)
+        [FromQuery] bool interpolate = false,
+        [FromQuery] string rateControl = "quality",
+        [FromQuery] string quality = "medium",
+        [FromQuery] string encoder = "auto")
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -103,12 +120,13 @@ public class VideoToolsController : BaseJellyfinApiController
             return NotFound();
         }
 
-        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error))
+        var useQuality = !string.Equals(rateControl, "bitrate", StringComparison.OrdinalIgnoreCase);
+        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error, useQuality))
         {
             return BadRequest(error);
         }
 
-        var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate);
+        var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate, useQuality, ParseQualityPreset(quality), ParseEncoderPreference(encoder));
         if (job is null)
         {
             return BadRequest("Item has no local video file.");
@@ -126,6 +144,9 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="bitrateKbps">Target video bitrate in kbps.</param>
     /// <param name="resolution">Maximum output resolution: 1080p (default) or 4k.</param>
     /// <param name="interpolate">When true, sources below 23 fps are motion-interpolated to 30 fps.</param>
+    /// <param name="rateControl">"quality" (default) or "bitrate".</param>
+    /// <param name="quality">Quality level used in quality mode.</param>
+    /// <param name="encoder">First encoder to try; "auto" keeps the default cascade.</param>
     /// <returns>The queued jobs and the names of the items that were skipped.</returns>
     [HttpPost("Transcode")]
     public ActionResult<TranscodeBatchResultDto> StartTranscodeBatch(
@@ -133,14 +154,18 @@ public class VideoToolsController : BaseJellyfinApiController
         [FromQuery] string codec = "h265",
         [FromQuery] int bitrateKbps = 3000,
         [FromQuery] string resolution = "1080p",
-        [FromQuery] bool interpolate = false)
+        [FromQuery] bool interpolate = false,
+        [FromQuery] string rateControl = "quality",
+        [FromQuery] string quality = "medium",
+        [FromQuery] string encoder = "auto")
     {
         if (itemIds is null || itemIds.Length == 0)
         {
             return BadRequest("No items were selected.");
         }
 
-        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error))
+        var useQuality = !string.Equals(rateControl, "bitrate", StringComparison.OrdinalIgnoreCase);
+        if (!TryParseTranscodeParams(codec, bitrateKbps, resolution, out var normalizedCodec, out var maxHeight, out var error, useQuality))
         {
             return BadRequest(error);
         }
@@ -155,7 +180,7 @@ public class VideoToolsController : BaseJellyfinApiController
                 continue;
             }
 
-            var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate);
+            var job = EnqueueTranscode(item, normalizedCodec, bitrateKbps, maxHeight, interpolate, useQuality, ParseQualityPreset(quality), ParseEncoderPreference(encoder));
             if (job is null)
             {
                 result.SkippedNames.Add(item.Name);
@@ -255,6 +280,32 @@ public class VideoToolsController : BaseJellyfinApiController
         job.SourceHeight = probe.Height;
         StartJob(job, BuildCutPlan(job, probe));
         return Accepted(job);
+    }
+
+    /// <summary>
+    /// Gets the queue defaults used when a job is started from the library without explicit settings.
+    /// </summary>
+    /// <returns>The stored defaults.</returns>
+    [HttpGet("Defaults")]
+    public ActionResult<VideoToolsDefaultsDto> GetDefaults()
+        => Ok(LoadDefaults());
+
+    /// <summary>
+    /// Replaces the queue defaults.
+    /// </summary>
+    /// <param name="defaults">The new defaults.</param>
+    /// <returns>The stored defaults.</returns>
+    [HttpPost("Defaults")]
+    public ActionResult<VideoToolsDefaultsDto> SaveDefaults([FromBody] VideoToolsDefaultsDto defaults)
+    {
+        if (defaults is null)
+        {
+            return BadRequest("No defaults were provided.");
+        }
+
+        var normalized = NormalizeDefaults(defaults);
+        SaveDefaultsToDisk(normalized);
+        return Ok(normalized);
     }
 
     /// <summary>
@@ -919,13 +970,30 @@ public class VideoToolsController : BaseJellyfinApiController
         }
     }
 
+    /// <summary>
+    /// Parses a quality preset name, defaulting to <see cref="VideoQualityPresets.medium"/>.
+    /// </summary>
+    /// <param name="value">The preset name.</param>
+    /// <returns>The parsed preset.</returns>
+    private static VideoQualityPresets ParseQualityPreset(string? value)
+        => Enum.TryParse<VideoQualityPresets>(value, true, out var preset) ? preset : VideoQualityPresets.medium;
+
+    /// <summary>
+    /// Parses an encoder preference name, defaulting to <see cref="VideoEncoderPreference.auto"/>.
+    /// </summary>
+    /// <param name="value">The encoder name.</param>
+    /// <returns>The parsed preference.</returns>
+    private static VideoEncoderPreference ParseEncoderPreference(string? value)
+        => Enum.TryParse<VideoEncoderPreference>(value, true, out var preference) ? preference : VideoEncoderPreference.auto;
+
     private static bool TryParseTranscodeParams(
         string codec,
         int bitrateKbps,
         string resolution,
         out string normalizedCodec,
         out int maxHeight,
-        out string? error)
+        out string? error,
+        bool useQuality = false)
     {
         normalizedCodec = codec.Trim().ToLowerInvariant();
         maxHeight = 0;
@@ -937,7 +1005,7 @@ public class VideoToolsController : BaseJellyfinApiController
             return false;
         }
 
-        if (bitrateKbps < 100 || bitrateKbps > 200000)
+        if (!useQuality && (bitrateKbps < 100 || bitrateKbps > 200000))
         {
             error = "bitrateKbps must be between 100 and 200000.";
             return false;
@@ -959,7 +1027,15 @@ public class VideoToolsController : BaseJellyfinApiController
         return true;
     }
 
-    private VideoToolJobDto? EnqueueTranscode(BaseItem item, string codec, int bitrateKbps, int maxHeight, bool interpolate)
+    private VideoToolJobDto? EnqueueTranscode(
+        BaseItem item,
+        string codec,
+        int bitrateKbps,
+        int maxHeight,
+        bool interpolate,
+        bool useQuality = true,
+        VideoQualityPresets qualityPreset = VideoQualityPresets.medium,
+        VideoEncoderPreference preferredEncoder = VideoEncoderPreference.auto)
     {
         var sourcePath = item.Path;
         if (string.IsNullOrWhiteSpace(sourcePath) || !System.IO.File.Exists(sourcePath))
@@ -982,7 +1058,7 @@ public class VideoToolsController : BaseJellyfinApiController
         job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
         job.BitrateKbps = bitrateKbps;
         job.FrameInterpolation = interpolate;
-        StartJob(job, BuildTranscodePlan(probe, sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, interpolate));
+        StartJob(job, BuildTranscodePlan(probe, sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, interpolate, useQuality, qualityPreset, preferredEncoder));
         return job;
     }
 
@@ -1031,6 +1107,12 @@ public class VideoToolsController : BaseJellyfinApiController
             OutputPath = job.WorkPath,
             Codec = "h265",
             BitrateKbps = Math.Max(3000, (int)Math.Round(EstimateReencodeBitrate(probe, job))),
+
+            // Cropping re-encodes the picture, so quality mode keeps the crop visually identical to
+            // the source instead of squeezing it into a guessed bitrate. Bitrate mode is still
+            // available on the transcode dialog for people who want a fixed size.
+            UseQuality = true,
+            QualityPreset = VideoQualityPresets.high,
             // Leave headroom to the encoder's bitrate ceiling: hardware encoders round the frame
             // size up to macroblock multiples, and that small overshoot must not trigger a scale.
             MaxHeight = probe.Height > 0 ? probe.Height * 2 : 2160,
@@ -1270,6 +1352,9 @@ public class VideoToolsController : BaseJellyfinApiController
     /// <param name="bitrateKbps">The target bitrate.</param>
     /// <param name="maxHeight">The maximum output height.</param>
     /// <param name="interpolate">Whether to motion-interpolate a low frame rate source to 30 fps.</param>
+    /// <param name="useQuality">Whether to encode to a quality level instead of a bitrate.</param>
+    /// <param name="qualityPreset">The quality level used when <paramref name="useQuality"/> is set.</param>
+    /// <param name="preferredEncoder">The encoder to try first, or <see cref="VideoEncoderPreference.auto"/>.</param>
     /// <returns>The attempts to run in order.</returns>
     private IReadOnlyList<TranscodePlanner.Attempt> BuildTranscodePlan(
         MediaProbe probe,
@@ -1278,7 +1363,10 @@ public class VideoToolsController : BaseJellyfinApiController
         string codec,
         int bitrateKbps,
         int maxHeight,
-        bool interpolate = false)
+        bool interpolate = false,
+        bool useQuality = true,
+        VideoQualityPresets qualityPreset = VideoQualityPresets.medium,
+        VideoEncoderPreference preferredEncoder = VideoEncoderPreference.auto)
     {
         var ffmpegPath = string.IsNullOrWhiteSpace(_mediaEncoder.EncoderPath) ? "ffmpeg" : _mediaEncoder.EncoderPath;
         var plan = TranscodePlanner.Build(new TranscodePlanner.Request
@@ -1287,6 +1375,9 @@ public class VideoToolsController : BaseJellyfinApiController
             OutputPath = workPath,
             Codec = codec,
             BitrateKbps = bitrateKbps,
+            UseQuality = useQuality,
+            QualityPreset = qualityPreset,
+            PreferredEncoder = preferredEncoder,
             MaxHeight = maxHeight,
             SourceVideoCodec = probe.VideoCodec,
             Width = probe.Width,
@@ -1566,8 +1657,97 @@ public class VideoToolsController : BaseJellyfinApiController
     /// with an mp4 container (no codec/container marker in the name), so the source itself is parked as
     /// "&lt;name&gt;.old&lt;ext&gt;" when the job succeeds.
     /// </summary>
-    /// <param name="sourcePath">The source file path.</param>
     /// <returns>The final path and the temporary work path.</returns>
+    /// <summary>
+    /// Path of the queue defaults file.
+    /// </summary>
+    /// <returns>The file path.</returns>
+    private string GetDefaultsFilePath()
+        => Path.Combine(
+            _serverConfigurationManager.ApplicationPaths.ConfigurationDirectoryPath,
+            "videotools-defaults.json");
+
+    /// <summary>
+    /// Loads the queue defaults, falling back to built-in values when the file is missing or broken.
+    /// </summary>
+    /// <returns>The defaults.</returns>
+    private VideoToolsDefaultsDto LoadDefaults()
+    {
+        try
+        {
+            var path = GetDefaultsFilePath();
+            if (System.IO.File.Exists(path))
+            {
+                var json = System.IO.File.ReadAllText(path);
+                var defaults = JsonSerializer.Deserialize<VideoToolsDefaultsDto>(
+                    json,
+                    DefaultsJsonOptions);
+
+                if (defaults is not null)
+                {
+                    return NormalizeDefaults(defaults);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not read video tool defaults, using built-in values");
+        }
+
+        return NormalizeDefaults(new VideoToolsDefaultsDto());
+    }
+
+    /// <summary>
+    /// Writes the queue defaults next to the server configuration.
+    /// </summary>
+    /// <param name="defaults">The defaults to persist.</param>
+    private void SaveDefaultsToDisk(VideoToolsDefaultsDto defaults)
+    {
+        var path = GetDefaultsFilePath();
+        Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
+        System.IO.File.WriteAllText(path, JsonSerializer.Serialize(defaults, DefaultsJsonOptions));
+    }
+
+    /// <summary>
+    /// Clamps the defaults to the values the transcode and cut pipelines accept.
+    /// </summary>
+    /// <param name="defaults">The incoming defaults.</param>
+    /// <returns>A normalized copy.</returns>
+    private static VideoToolsDefaultsDto NormalizeDefaults(VideoToolsDefaultsDto defaults)
+    {
+        var transcode = defaults.Transcode ?? new VideoToolsTranscodeDefaults();
+        var cut = defaults.Cut ?? new VideoToolsCutDefaults();
+
+        transcode.Codec = string.Equals(transcode.Codec, "av1", StringComparison.OrdinalIgnoreCase) ? "av1" : "h265";
+        transcode.Encoder = string.IsNullOrWhiteSpace(transcode.Encoder) ? "auto" : transcode.Encoder.Trim().ToLowerInvariant();
+        transcode.Resolution = string.Equals(transcode.Resolution, "4k", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(transcode.Resolution, "2160p", StringComparison.OrdinalIgnoreCase)
+                ? "4k"
+                : "1080p";
+        transcode.RateControl = string.Equals(transcode.RateControl, "bitrate", StringComparison.OrdinalIgnoreCase) ? "bitrate" : "quality";
+        transcode.Quality = NormalizeQuality(transcode.Quality, "medium");
+        transcode.BitrateKbps = Math.Clamp(transcode.BitrateKbps, 100, 200000);
+
+        cut.Encoder = string.IsNullOrWhiteSpace(cut.Encoder) ? "auto" : cut.Encoder.Trim().ToLowerInvariant();
+        cut.RateControl = string.Equals(cut.RateControl, "bitrate", StringComparison.OrdinalIgnoreCase) ? "bitrate" : "quality";
+        cut.Quality = NormalizeQuality(cut.Quality, "high");
+        cut.BitrateKbps = Math.Clamp(cut.BitrateKbps, 100, 200000);
+
+        return new VideoToolsDefaultsDto { Transcode = transcode, Cut = cut };
+    }
+
+    /// <summary>
+    /// Maps a quality name onto the supported presets.
+    /// </summary>
+    /// <param name="value">The requested quality.</param>
+    /// <param name="fallback">The value used when the request is not recognized.</param>
+    /// <returns>The quality name.</returns>
+    private static string NormalizeQuality(string? value, string fallback)
+    {
+        var quality = value?.Trim().ToLowerInvariant();
+        return quality is "highest" or "high" or "medium" or "low" or "lowest" ? quality : fallback;
+    }
+
     private static (string FinalPath, string WorkPath) CreateTranscodePaths(string sourcePath)
     {
         var directory = Path.GetDirectoryName(sourcePath)!;

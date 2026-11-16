@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using MediaBrowser.Model.Configuration;
 
 namespace Jellyfin.Api.Helpers;
 
@@ -90,7 +91,7 @@ internal static class TranscodePlanner
         var attempts = new List<Attempt>();
         var interpolate = ShouldInterpolate(request);
 
-        foreach (var (encoder, label) in GetCandidates(isAv1))
+        foreach (var (encoder, label) in GetCandidates(isAv1, request.PreferredEncoder))
         {
             var isHardware = IsHardwareEncoder(encoder);
             var needsCpuFrames = !string.IsNullOrWhiteSpace(request.VideoFilter);
@@ -287,21 +288,93 @@ internal static class TranscodePlanner
         };
     }
 
-    private static (string Encoder, string Label)[] GetCandidates(bool isAv1)
+    private static (string Encoder, string Label)[] GetCandidates(bool isAv1, VideoEncoderPreference preferred = VideoEncoderPreference.auto)
     {
-        return isAv1
+        var candidates = isAv1
             ?
-            [
+            new (string, string)[]
+            {
                 ("av1_qsv", "Intel QSV AV1"),
                 ("av1_nvenc", "NVIDIA NVENC AV1"),
                 ("libsvtav1", "SVT-AV1 (software)")
-            ]
+            }
             :
             [
                 ("hevc_qsv", "Intel QSV H.265"),
                 ("hevc_nvenc", "NVIDIA NVENC H.265"),
                 ("libx265", "x265 (software)")
             ];
+
+        // An explicit encoder selection moves to the front; the rest of the cascade stays as the
+        // fallback so a broken GPU still ends on the software encoder.
+        if (preferred != VideoEncoderPreference.auto)
+        {
+            var name = preferred.ToString();
+            var index = Array.FindIndex(candidates, c => string.Equals(c.Item1, name, StringComparison.OrdinalIgnoreCase));
+            if (index > 0)
+            {
+                var chosen = candidates[index];
+                Array.Copy(candidates, 0, candidates, 1, index);
+                candidates[0] = chosen;
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// Maps a quality preset to the encoder's quality scale.
+    /// </summary>
+    /// <param name="encoder">The video encoder name.</param>
+    /// <param name="preset">The quality preset.</param>
+    /// <returns>The quality value for that encoder.</returns>
+    private static int GetQualityValue(string encoder, VideoQualityPresets preset)
+    {
+        if (string.Equals(encoder, "libsvtav1", StringComparison.OrdinalIgnoreCase))
+        {
+            return preset switch
+            {
+                VideoQualityPresets.highest => 20,
+                VideoQualityPresets.high => 26,
+                VideoQualityPresets.medium => 32,
+                VideoQualityPresets.low => 40,
+                _ => 48
+            };
+        }
+
+        if (string.Equals(encoder, "libx264", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(encoder, "libx265", StringComparison.OrdinalIgnoreCase))
+        {
+            return preset switch
+            {
+                VideoQualityPresets.highest => 18,
+                VideoQualityPresets.high => 20,
+                VideoQualityPresets.medium => 23,
+                VideoQualityPresets.low => 26,
+                _ => 30
+            };
+        }
+
+        if (encoder.EndsWith("_qsv", StringComparison.Ordinal))
+        {
+            return preset switch
+            {
+                VideoQualityPresets.highest => 16,
+                VideoQualityPresets.high => 20,
+                VideoQualityPresets.medium => 25,
+                VideoQualityPresets.low => 30,
+                _ => 35
+            };
+        }
+
+        return preset switch
+        {
+            VideoQualityPresets.highest => 17,
+            VideoQualityPresets.high => 21,
+            VideoQualityPresets.medium => 25,
+            VideoQualityPresets.low => 29,
+            _ => 34
+        };
     }
 
     private static Attempt BuildAttempt(
@@ -391,8 +464,31 @@ internal static class TranscodePlanner
         args.Add("-preset");
         args.Add(encoder == "libsvtav1" ? "8" : "medium");
 
-        args.Add("-b:v");
-        args.Add(request.BitrateKbps.ToString(CultureInfo.InvariantCulture) + "k");
+        if (request.UseQuality)
+        {
+            // Quality mode: no target bitrate at all, the encoder spends what the quality level needs.
+            // AV1 QSV rejects the ICQ path on some drivers, constant quantizer is honoured everywhere.
+            var quality = GetQualityValue(encoder, request.QualityPreset);
+            if (string.Equals(encoder, "av1_qsv", StringComparison.OrdinalIgnoreCase))
+            {
+                args.AddRange(["-q:v", quality.ToString(CultureInfo.InvariantCulture)]);
+            }
+            else if (string.Equals(encoder, "libsvtav1", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(encoder, "libx264", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(encoder, "libx265", StringComparison.OrdinalIgnoreCase))
+            {
+                args.AddRange(["-crf", quality.ToString(CultureInfo.InvariantCulture)]);
+            }
+            else
+            {
+                args.AddRange(["-global_quality", quality.ToString(CultureInfo.InvariantCulture)]);
+            }
+        }
+        else
+        {
+            args.Add("-b:v");
+            args.Add(request.BitrateKbps.ToString(CultureInfo.InvariantCulture) + "k");
+        }
 
         // The encoder derives its frame-rate based bitrate control from the stream frame rate, which
         // is wrong on lots of remuxed/phone files (120/1 reported for a 30 fps video). A 3000k
@@ -406,7 +502,8 @@ internal static class TranscodePlanner
             args.Add(FormatFrameRate(frameRate));
         }
 
-        if (!isAv1)
+        // A bitrate cap only makes sense in bitrate mode: in quality mode it would defeat the point.
+        if (!isAv1 && !request.UseQuality)
         {
             args.Add("-maxrate");
             args.Add(request.BitrateKbps.ToString(CultureInfo.InvariantCulture) + "k");
@@ -543,6 +640,21 @@ internal static class TranscodePlanner
         /// Gets the target video bitrate in kbps.
         /// </summary>
         public int BitrateKbps { get; init; }
+
+        /// <summary>
+        /// Gets a value indicating whether the encoder should target a quality level instead of a bitrate.
+        /// </summary>
+        public bool UseQuality { get; init; }
+
+        /// <summary>
+        /// Gets the quality level used when <see cref="UseQuality"/> is set.
+        /// </summary>
+        public VideoQualityPresets QualityPreset { get; init; }
+
+        /// <summary>
+        /// Gets the encoder to run first, or <c>null</c> to use the default cascade.
+        /// </summary>
+        public VideoEncoderPreference PreferredEncoder { get; init; }
 
         /// <summary>
         /// Gets the maximum output height.

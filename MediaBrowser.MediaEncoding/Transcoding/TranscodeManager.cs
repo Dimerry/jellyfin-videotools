@@ -375,7 +375,8 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         Guid userId,
         TranscodingJobType transcodingJobType,
         CancellationTokenSource cancellationTokenSource,
-        string? workingDirectory = null)
+        string? workingDirectory = null,
+        Func<string, string>? argumentsForEncoder = null)
     {
         var directory = Path.GetDirectoryName(outputPath) ?? throw new ArgumentException($"Provided path ({outputPath}) is not valid.", nameof(outputPath));
         Directory.CreateDirectory(directory);
@@ -414,26 +415,7 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
             }
         }
 
-        var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                WindowStyle = ProcessWindowStyle.Hidden,
-                CreateNoWindow = true,
-                UseShellExecute = false,
-
-                // Must consume both stdout and stderr or deadlocks may occur
-                // RedirectStandardOutput = true,
-                StandardErrorEncoding = Encoding.UTF8,
-                RedirectStandardError = true,
-                RedirectStandardInput = true,
-                FileName = _mediaEncoder.EncoderPath,
-                Arguments = commandLineArguments,
-                WorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? string.Empty : workingDirectory,
-                ErrorDialog = false
-            },
-            EnableRaisingEvents = true
-        };
+        var process = CreateEncoderProcess(commandLineArguments, workingDirectory);
 
         var transcodingJob = OnTranscodeBeginning(
             outputPath,
@@ -467,7 +449,7 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
             $"{logFilePrefix}{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{state.Request.MediaSourceId}_{Guid.NewGuid().ToString()[..8]}.log");
 
         // FFmpeg writes debug/error info to stderr. This is useful when debugging so let's put it in the log directory.
-        Stream logStream = new FileStream(
+        var logStream = new FileStream(
             logFilePath,
             FileMode.Create,
             FileAccess.Write,
@@ -525,6 +507,89 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
             }
         }
 
+        // Encoder ladder: when ffmpeg dies before the first output frame, the encoder itself was
+        // refused. Try the next encoder the machine supports and finally the software encoder, so
+        // a broken or missing GPU never leaves the session without video.
+        var encodingOptions = _serverConfigurationManager.GetEncodingOptions();
+        var currentEncoder = state.IsOutputVideo ? _encodingHelper.GetVideoEncoder(state, encodingOptions) : null;
+
+        while (transcodingJob.HasExited
+               && transcodingJob.ExitCode != 0
+               && state.IsOutputVideo
+               && argumentsForEncoder is not null)
+        {
+            var nextEncoder = _encodingHelper.GetNextVideoEncoder(state, encodingOptions, currentEncoder);
+            if (nextEncoder is null)
+            {
+                break;
+            }
+
+            var retryArguments = argumentsForEncoder(nextEncoder);
+            if (string.IsNullOrWhiteSpace(retryArguments))
+            {
+                break;
+            }
+
+            _logger.LogWarning(
+                "FFmpeg exited with code {ExitCode} using {Encoder}, retrying with {NextEncoder}",
+                transcodingJob.ExitCode,
+                currentEncoder,
+                nextEncoder);
+
+            TryDeleteWorkOutput(outputPath);
+            process.Dispose();
+
+            // The previous attempt owns the log stream; the JobLogger attached to it ends with the
+            // process, so the handle can be handed over to the retry.
+            await logStream.DisposeAsync().ConfigureAwait(false);
+            state.TranscodingJob = null;
+
+            process = CreateEncoderProcess(retryArguments, workingDirectory);
+            transcodingJob = OnTranscodeBeginning(
+                outputPath,
+                state.Request.PlaySessionId,
+                state.MediaSource.LiveStreamId,
+                Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture),
+                transcodingJobType,
+                process,
+                state.Request.DeviceId,
+                state,
+                cancellationTokenSource);
+            process.Exited += (_, _) => OnFfMpegProcessExited(process, transcodingJob, state);
+
+            logStream = new FileStream(
+                logFilePath,
+                FileMode.Append,
+                FileAccess.Write,
+                FileShare.Read,
+                IODefaults.FileStreamBufferSize,
+                FileOptions.Asynchronous);
+            var retryHeader = Encoding.UTF8.GetBytes(
+                Environment.NewLine
+                + Environment.NewLine
+                + process.StartInfo.FileName + " " + process.StartInfo.Arguments
+                + Environment.NewLine
+                + Environment.NewLine);
+            await logStream.WriteAsync(retryHeader, cancellationTokenSource.Token).ConfigureAwait(false);
+
+            _logger.LogInformation("{Filename} {Arguments}", process.StartInfo.FileName, process.StartInfo.Arguments);
+            process.Start();
+            state.TranscodingJob = transcodingJob;
+            _ = new JobLogger(_logger).StartStreamingLog(state, process.StandardError, logStream);
+
+            currentEncoder = nextEncoder;
+
+            while (!File.Exists(ffmpegTargetFile) && !transcodingJob.HasExited)
+            {
+                await Task.Delay(100, cancellationTokenSource.Token).ConfigureAwait(false);
+            }
+
+            if (state.IsInputVideo && transcodingJob.Type == TranscodingJobType.Progressive && !transcodingJob.HasExited)
+            {
+                await Task.Delay(1000, cancellationTokenSource.Token).ConfigureAwait(false);
+            }
+        }
+
         if (!transcodingJob.HasExited)
         {
             StartThrottler(state, transcodingJob);
@@ -538,6 +603,62 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         _logger.LogDebug("StartFfMpeg() finished successfully");
 
         return transcodingJob;
+    }
+
+    /// <summary>
+    /// Creates the ffmpeg process for one encoder attempt.
+    /// </summary>
+    /// <param name="commandLineArguments">The ffmpeg arguments.</param>
+    /// <param name="workingDirectory">The working directory, if any.</param>
+    /// <returns>The configured process.</returns>
+    private Process CreateEncoderProcess(string commandLineArguments, string? workingDirectory)
+    {
+        return new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                WindowStyle = ProcessWindowStyle.Hidden,
+                CreateNoWindow = true,
+                UseShellExecute = false,
+
+                // Must consume both stdout and stderr or deadlocks may occur
+                // RedirectStandardOutput = true,
+                StandardErrorEncoding = Encoding.UTF8,
+                RedirectStandardError = true,
+                RedirectStandardInput = true,
+                FileName = _mediaEncoder.EncoderPath,
+                Arguments = commandLineArguments,
+                WorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? string.Empty : workingDirectory,
+                ErrorDialog = false
+            },
+            EnableRaisingEvents = true
+        };
+    }
+
+    /// <summary>
+    /// Removes a partially written output so the next encoder attempt starts clean.
+    /// </summary>
+    /// <param name="outputPath">The playlist or file the failed attempt was writing.</param>
+    private void TryDeleteWorkOutput(string outputPath)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(outputPath);
+            if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+            {
+                return;
+            }
+
+            var prefix = Path.GetFileNameWithoutExtension(outputPath);
+            foreach (var file in Directory.EnumerateFiles(directory, prefix + "*"))
+            {
+                System.IO.File.Delete(file);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not clean up the failed transcode output {OutputPath}", outputPath);
+        }
     }
 
     private void StartThrottler(StreamState state, TranscodingJob transcodingJob)

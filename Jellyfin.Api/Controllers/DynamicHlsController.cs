@@ -312,7 +312,8 @@ public class DynamicHlsController : BaseJellyfinApiController
                                 GetCommandLineArguments(playlistPath, state, true, 0),
                                 Request.HttpContext.User.GetUserId(),
                                 TranscodingJobType,
-                                cancellationTokenSource)
+                                cancellationTokenSource,
+                                argumentsForEncoder: encoder => GetCommandLineArguments(playlistPath, state, true, 0, encoder))
                             .ConfigureAwait(false);
                         job.IsLiveOutput = true;
                     }
@@ -1518,7 +1519,8 @@ public class DynamicHlsController : BaseJellyfinApiController
                         GetCommandLineArguments(playlistPath, state, false, segmentId),
                         Request.HttpContext.User.GetUserId(),
                         TranscodingJobType,
-                        cancellationTokenSource).ConfigureAwait(false);
+                        cancellationTokenSource,
+                        argumentsForEncoder: encoder => GetCommandLineArguments(playlistPath, state, false, segmentId, encoder)).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -1575,7 +1577,7 @@ public class DynamicHlsController : BaseJellyfinApiController
         return segments;
     }
 
-    private string GetCommandLineArguments(string outputPath, StreamState state, bool isEventPlaylist, int startNumber)
+    private string GetCommandLineArguments(string outputPath, StreamState state, bool isEventPlaylist, int startNumber, string? forcedEncoder = null)
     {
         var videoCodec = _encodingHelper.GetVideoEncoder(state, _encodingOptions);
         var threads = EncodingHelper.GetNumberOfThreads(state, _encodingOptions, videoCodec);
@@ -1641,10 +1643,10 @@ public class DynamicHlsController : BaseJellyfinApiController
             CultureInfo.InvariantCulture,
             "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} -copyts -avoid_negative_ts disabled -max_muxing_queue_size {6} -f hls -max_delay 5000000 -hls_time {7} -hls_segment_type {8} -start_number {9}{10} -hls_segment_filename \"{11}\" {12} -y \"{13}\"",
             inputModifier,
-            _encodingHelper.GetInputArgument(state, _encodingOptions, segmentContainer),
+            _encodingHelper.GetInputArgument(state, _encodingOptions, segmentContainer, forcedEncoder),
             threads,
             mapArgs,
-            GetVideoArguments(state, startNumber, isEventPlaylist, segmentContainer),
+            GetVideoArguments(state, startNumber, isEventPlaylist, segmentContainer, forcedEncoder),
             GetAudioArguments(state),
             maxMuxingQueueSize,
             state.SegmentLength.ToString(CultureInfo.InvariantCulture),
@@ -1788,14 +1790,16 @@ public class DynamicHlsController : BaseJellyfinApiController
     }
 
     /// <summary>
-    /// Gets the video arguments for transcoding.
+    /// Gets the video arguments for transcoding, optionally for an explicit encoder so a failed
+    /// attempt can be rebuilt for the next encoder of the ladder.
     /// </summary>
     /// <param name="state">The <see cref="StreamState"/>.</param>
     /// <param name="startNumber">The first number in the hls sequence.</param>
     /// <param name="isEventPlaylist">Whether the playlist is EVENT or VOD.</param>
     /// <param name="segmentContainer">The segment container.</param>
+    /// <param name="forcedEncoder">The encoder to emit arguments for, or <c>null</c> for the configured one.</param>
     /// <returns>The command line arguments for video transcoding.</returns>
-    private string GetVideoArguments(StreamState state, int startNumber, bool isEventPlaylist, string segmentContainer)
+    private string GetVideoArguments(StreamState state, int startNumber, bool isEventPlaylist, string segmentContainer, string? forcedEncoder = null)
     {
         if (state.VideoStream is null)
         {
@@ -1807,7 +1811,7 @@ public class DynamicHlsController : BaseJellyfinApiController
             return string.Empty;
         }
 
-        var codec = _encodingHelper.GetVideoEncoder(state, _encodingOptions);
+        var codec = forcedEncoder ?? _encodingHelper.GetVideoEncoder(state, _encodingOptions);
 
         var args = "-codec:v:0 " + codec;
 

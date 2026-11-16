@@ -210,6 +210,183 @@ namespace MediaBrowser.Controller.MediaEncoding
         public string GetAv1Encoder(EncodingJobInfo state, EncodingOptions encodingOptions)
             => GetH26xOrAv1Encoder("libsvtav1", "av1", state, encodingOptions);
 
+        /// <summary>
+        /// Resolves the ordered list of video encoders to try for this job, best first.
+        /// </summary>
+        /// <remarks>
+        /// With <see cref="VideoEncoderPreference.auto"/> the list is the historic pair: the encoder of
+        /// the configured hardware acceleration type (when hardware encoding is enabled) and then the
+        /// software encoder. A specific encoder selection returns that encoder first, then every other
+        /// hardware encoder for the same codec that this machine actually supports, and the software
+        /// encoder last, so a broken or missing GPU never leaves the job without an encoder.
+        /// </remarks>
+        /// <param name="state">Encoding state.</param>
+        /// <param name="encodingOptions">Encoding options.</param>
+        /// <returns>The encoder cascade, tried in order.</returns>
+        public IReadOnlyList<string> GetVideoEncoderCandidates(EncodingJobInfo state, EncodingOptions encodingOptions)
+        {
+            var codec = state.OutputVideoCodec;
+
+            if (string.Equals(codec, "av1", StringComparison.OrdinalIgnoreCase))
+            {
+                return GetEncoderCandidates("libsvtav1", "av1", state, encodingOptions);
+            }
+
+            if (string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase))
+            {
+                return GetEncoderCandidates("libx265", "hevc", state, encodingOptions);
+            }
+
+            if (string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase))
+            {
+                return GetEncoderCandidates("libx264", "h264", state, encodingOptions);
+            }
+
+            return Array.Empty<string>();
+        }
+
+        private IReadOnlyList<string> GetEncoderCandidates(string defaultEncoder, string hwEncoder, EncodingJobInfo state, EncodingOptions encodingOptions)
+        {
+            var candidates = new List<string>();
+
+            var preference = encodingOptions.HardwareEncoder;
+            var softwareEncoder = preference switch
+            {
+                VideoEncoderPreference.libx264 => "libx264",
+                VideoEncoderPreference.libx265 => "libx265",
+                VideoEncoderPreference.libsvtav1 => "libsvtav1",
+                _ => defaultEncoder
+            };
+
+            if (preference == VideoEncoderPreference.auto || state.VideoType != VideoType.VideoFile)
+            {
+                var preferred = GetH26xOrAv1Encoder(softwareEncoder, hwEncoder, state, encodingOptions);
+                candidates.Add(preferred);
+                if (!string.Equals(preferred, softwareEncoder, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidates.Add(softwareEncoder);
+                }
+
+                return candidates;
+            }
+
+            // Explicit encoder selection for this codec: keep it first even when the advertised
+            // encoder list does not contain it, ffmpeg still refuses to open it and the worker falls through.
+            var explicitEncoder = preference.ToString();
+            if (explicitEncoder.StartsWith(hwEncoder + "_", StringComparison.Ordinal))
+            {
+                candidates.Add(explicitEncoder);
+            }
+
+            foreach (var fallback in GetHardwareEncoderPreferenceOrder(hwEncoder))
+            {
+                if (candidates.Contains(fallback, StringComparer.OrdinalIgnoreCase)
+                    || !_mediaEncoder.SupportsEncoder(fallback))
+                {
+                    continue;
+                }
+
+                // A hardware encoder that cannot receive GPU frames on this machine is never
+                // "supported" in a useful way; leaving it out keeps the cascade honest.
+                if (fallback.EndsWith("_qsv", StringComparison.Ordinal) && !_mediaEncoder.SupportsHwaccel("qsv"))
+                {
+                    continue;
+                }
+
+                if (fallback.EndsWith("_nvenc", StringComparison.Ordinal) && !_mediaEncoder.SupportsHwaccel("cuda"))
+                {
+                    continue;
+                }
+
+                if (fallback.EndsWith("_vaapi", StringComparison.Ordinal) && !_mediaEncoder.SupportsHwaccel("vaapi"))
+                {
+                    continue;
+                }
+
+                candidates.Add(fallback);
+            }
+
+            candidates.Add(softwareEncoder);
+            return candidates;
+        }
+
+        /// <summary>
+        /// Returns the next encoder to try when <paramref name="failedEncoder"/> could not produce
+        /// output, or <c>null</c> when the cascade is exhausted (the software encoder was last).
+        /// </summary>
+        /// <param name="state">Encoding state.</param>
+        /// <param name="encodingOptions">Encoding options.</param>
+        /// <param name="failedEncoder">The encoder that just failed.</param>
+        /// <returns>The next encoder name, or <c>null</c> at the end of the cascade.</returns>
+        public string GetNextVideoEncoder(EncodingJobInfo state, EncodingOptions encodingOptions, string failedEncoder)
+        {
+            var candidates = GetVideoEncoderCandidates(state, encodingOptions);
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            var index = string.IsNullOrEmpty(failedEncoder)
+                ? -1
+                : candidates.ToList().FindIndex(c => string.Equals(c, failedEncoder, StringComparison.OrdinalIgnoreCase));
+
+            return index + 1 < candidates.Count ? candidates[index + 1] : null;
+        }
+
+        /// <summary>
+        /// Tells whether frames for this encoder come from the GPU decoder, so the ffmpeg input
+        /// arguments match the encoder that is actually going to run.
+        /// </summary>
+        /// <param name="state">Encoding state.</param>
+        /// <param name="encodingOptions">Encoding options.</param>
+        /// <param name="encoder">The video encoder name.</param>
+        /// <returns><c>true</c> when hardware decoding is used for this encoder.</returns>
+        public bool IsHardwareDecodeForEncoder(EncodingJobInfo state, EncodingOptions encodingOptions, string encoder)
+        {
+            if (encodingOptions.HardwareAccelerationType == HardwareAccelerationType.none
+                || string.Equals(encoder, "copy", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (encoder.EndsWith("_qsv", StringComparison.Ordinal))
+            {
+                return encodingOptions.HardwareAccelerationType == HardwareAccelerationType.qsv
+                       && _mediaEncoder.SupportsHwaccel("qsv");
+            }
+
+            if (encoder.EndsWith("_nvenc", StringComparison.Ordinal))
+            {
+                return encodingOptions.HardwareAccelerationType == HardwareAccelerationType.nvenc
+                       && _mediaEncoder.SupportsHwaccel("cuda");
+            }
+
+            if (encoder.EndsWith("_vaapi", StringComparison.Ordinal))
+            {
+                return encodingOptions.HardwareAccelerationType == HardwareAccelerationType.vaapi
+                       && _mediaEncoder.SupportsHwaccel("vaapi");
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Hardware encoders to try, in order, for a codec when the requested one is unavailable.
+        /// </summary>
+        /// <param name="hwEncoder">The codec name used by the encoders, e.g. <c>hevc</c>.</param>
+        /// <returns>The hardware encoder names.</returns>
+        private static string[] GetHardwareEncoderPreferenceOrder(string hwEncoder)
+            =>
+            [
+                hwEncoder + "_qsv",
+                hwEncoder + "_nvenc",
+                hwEncoder + "_vaapi",
+                hwEncoder + "_videotoolbox",
+                hwEncoder + "_amf",
+                hwEncoder + "_rkmpp"
+            ];
+
         private string GetH26xOrAv1Encoder(string defaultEncoder, string hwEncoder, EncodingJobInfo state, EncodingOptions encodingOptions)
         {
             // Only use alternative encoders for video files.
@@ -485,20 +662,12 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             if (!string.IsNullOrEmpty(codec))
             {
-                if (string.Equals(codec, "av1", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(codec, "av1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase))
                 {
-                    return GetAv1Encoder(state, encodingOptions);
-                }
-
-                if (string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase))
-                {
-                    return GetH265Encoder(state, encodingOptions);
-                }
-
-                if (string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase))
-                {
-                    return GetH264Encoder(state, encodingOptions);
+                    return GetVideoEncoderCandidates(state, encodingOptions)[0];
                 }
 
                 if (string.Equals(codec, "mjpeg", StringComparison.OrdinalIgnoreCase))
@@ -1015,13 +1184,24 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <param name="options">Encoding options.</param>
         /// <returns>Input video hwaccel arguments.</returns>
         public string GetInputVideoHwaccelArgs(EncodingJobInfo state, EncodingOptions options)
+            => GetInputVideoHwaccelArgs(state, options, null);
+
+        /// <summary>
+        /// Gets the hardware decoder arguments for an explicit video encoder, so a retried
+        /// transcode decodes in the format that encoder expects.
+        /// </summary>
+        /// <param name="state">Encoding state.</param>
+        /// <param name="options">Encoding options.</param>
+        /// <param name="forcedEncoder">The encoder to build the arguments for, or <c>null</c> for the configured one.</param>
+        /// <returns>The hardware decode arguments.</returns>
+        public string GetInputVideoHwaccelArgs(EncodingJobInfo state, EncodingOptions options, string forcedEncoder)
         {
             if (!state.IsVideoRequest)
             {
                 return string.Empty;
             }
 
-            var vidEncoder = GetVideoEncoder(state, options) ?? string.Empty;
+            var vidEncoder = forcedEncoder ?? GetVideoEncoder(state, options) ?? string.Empty;
             if (IsCopyCodec(vidEncoder))
             {
                 return string.Empty;
@@ -1249,9 +1429,21 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <param name="segmentContainer">Segment Container.</param>
         /// <returns>Input arguments.</returns>
         public string GetInputArgument(EncodingJobInfo state, EncodingOptions options, string segmentContainer)
+            => GetInputArgument(state, options, segmentContainer, null);
+
+        /// <summary>
+        /// Gets the input arguments for an explicit video encoder, so a retried transcode decodes in
+        /// the format that encoder expects.
+        /// </summary>
+        /// <param name="state">Encoding state.</param>
+        /// <param name="options">Encoding options.</param>
+        /// <param name="segmentContainer">Segment container.</param>
+        /// <param name="forcedEncoder">The encoder to build the arguments for, or <c>null</c> for the configured one.</param>
+        /// <returns>Input arguments.</returns>
+        public string GetInputArgument(EncodingJobInfo state, EncodingOptions options, string segmentContainer, string forcedEncoder)
         {
             var arg = new StringBuilder();
-            var inputVidHwaccelArgs = GetInputVideoHwaccelArgs(state, options);
+            var inputVidHwaccelArgs = GetInputVideoHwaccelArgs(state, options, forcedEncoder);
 
             if (!string.IsNullOrEmpty(inputVidHwaccelArgs))
             {
@@ -1630,6 +1822,110 @@ namespace MediaBrowser.Controller.MediaEncoding
             }
 
             return ".ts";
+        }
+
+        /// <summary>
+        /// Maps a quality preset to the encoder's quality scale.
+        /// </summary>
+        /// <remarks>
+        /// QSV and x264/x265 share the 0–51 quantizer scale but do not mean the same numbers: QSV's
+        /// ICQ scale starts getting blurry a lot sooner than x265's CRF, so the two are mapped
+        /// separately. NVENC and VA-API use the same 0–51 qp scale, their quality mode is more
+        /// conservative so a slightly lower value is used. AV1 in SVT is on the same 0–63 CRF scale.
+        /// </remarks>
+        /// <param name="encodingOptions">Encoding options.</param>
+        /// <param name="videoEncoder">The video encoder name.</param>
+        /// <returns>The quality value for that encoder.</returns>
+        private static int GetQualityValue(EncodingOptions encodingOptions, string videoEncoder)
+        {
+            var preset = encodingOptions.VideoQualityPreset;
+
+            if (string.Equals(videoEncoder, "libsvtav1", StringComparison.OrdinalIgnoreCase))
+            {
+                return preset switch
+                {
+                    VideoQualityPresets.highest => 20,
+                    VideoQualityPresets.high => 26,
+                    VideoQualityPresets.medium => 32,
+                    VideoQualityPresets.low => 40,
+                    _ => 48
+                };
+            }
+
+            if (string.Equals(videoEncoder, "libx264", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(videoEncoder, "libx265", StringComparison.OrdinalIgnoreCase))
+            {
+                return preset switch
+                {
+                    VideoQualityPresets.highest => 18,
+                    VideoQualityPresets.high => 20,
+                    VideoQualityPresets.medium => 23,
+                    VideoQualityPresets.low => 26,
+                    _ => 30
+                };
+            }
+
+            if (videoEncoder.EndsWith("_qsv", StringComparison.Ordinal))
+            {
+                return preset switch
+                {
+                    VideoQualityPresets.highest => 16,
+                    VideoQualityPresets.high => 20,
+                    VideoQualityPresets.medium => 25,
+                    VideoQualityPresets.low => 30,
+                    _ => 35
+                };
+            }
+
+            if (videoEncoder.EndsWith("_nvenc", StringComparison.Ordinal)
+                || videoEncoder.EndsWith("_vaapi", StringComparison.Ordinal)
+                || videoEncoder.EndsWith("_amf", StringComparison.Ordinal)
+                || videoEncoder.EndsWith("_videotoolbox", StringComparison.Ordinal))
+            {
+                return preset switch
+                {
+                    VideoQualityPresets.highest => 17,
+                    VideoQualityPresets.high => 21,
+                    VideoQualityPresets.medium => 25,
+                    VideoQualityPresets.low => 29,
+                    _ => 34
+                };
+            }
+
+            return 25;
+        }
+
+        /// <summary>
+        /// Builds the rate-control arguments for quality mode: no target bitrate, the encoder picks
+        /// the bitrate the requested quality needs.
+        /// </summary>
+        /// <param name="encodingOptions">Encoding options.</param>
+        /// <param name="videoEncoder">The video encoder name.</param>
+        /// <returns>The ffmpeg arguments.</returns>
+        private static string GetVideoQualityParam(EncodingOptions encodingOptions, string videoEncoder)
+        {
+            var quality = GetQualityValue(encodingOptions, videoEncoder);
+
+            // AV1 QSV does not accept the ICQ/global-quality path on every driver generation
+            // (VPL rejects the rate-control mode outright), so it is encoded with constant
+            // quantizer arguments instead, which are honoured by both old and new drivers.
+            if (string.Equals(videoEncoder, "av1_qsv", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Create(CultureInfo.InvariantCulture, $" -q:v {quality} -max_qp_i {Math.Min(quality + 6, 63)} -max_qp_p {Math.Min(quality + 8, 63)}");
+            }
+
+            if (string.Equals(videoEncoder, "libsvtav1", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Create(CultureInfo.InvariantCulture, $" -crf {quality}");
+            }
+
+            if (string.Equals(videoEncoder, "libx264", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(videoEncoder, "libx265", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Create(CultureInfo.InvariantCulture, $" -crf {quality}");
+            }
+
+            return string.Create(CultureInfo.InvariantCulture, $" -global_quality {quality}");
         }
 
         private string GetVideoBitrateParam(EncodingJobInfo state, string videoCodec)
@@ -2194,7 +2490,9 @@ namespace MediaBrowser.Controller.MediaEncoding
             var encodingPreset = encodingOptions.EncoderPreset;
 
             param += GetEncoderParam(encodingPreset, defaultPreset, encodingOptions, videoEncoder, isLibX265);
-            param += GetVideoBitrateParam(state, videoEncoder);
+            param += encodingOptions.VideoRateControlMode == VideoRateControlModes.quality
+                ? GetVideoQualityParam(encodingOptions, videoEncoder)
+                : GetVideoBitrateParam(state, videoEncoder);
 
             var framerate = GetFramerateParam(state);
             if (framerate.HasValue)
