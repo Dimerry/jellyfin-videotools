@@ -34,9 +34,19 @@ public sealed class VideoToolJobDto
     public string? Resolution { get; set; }
 
     /// <summary>
-    /// Gets or sets the target video bitrate in kbps, if this is a transcode job.
+    /// Gets or sets the target video bitrate in kbps when encoding to a bitrate; null in quality mode.
     /// </summary>
     public int? BitrateKbps { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the video is encoded to a quality level instead of a target bitrate.
+    /// </summary>
+    public bool UseQuality { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets the quality preset name used when <see cref="UseQuality"/> is set.
+    /// </summary>
+    public string? Quality { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether this transcode motion-interpolates a low frame

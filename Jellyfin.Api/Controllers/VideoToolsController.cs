@@ -369,6 +369,9 @@ public class VideoToolsController : BaseJellyfinApiController
         if (HasCrop(cropLeft, cropRight))
         {
             job.Codec = string.Equals(cutCodec, "av1", StringComparison.OrdinalIgnoreCase) ? "AV1" : "H.265";
+            job.UseQuality = useQuality;
+            job.Quality = useQuality ? qualityPreset.ToString().ToLowerInvariant() : null;
+            job.BitrateKbps = useQuality ? null : Math.Max(3000, (int)Math.Round(EstimateReencodeBitrate(probe, job)));
         }
 
         StartJob(job, BuildCutPlan(job, probe, cutCodec, useQuality, qualityPreset, encoderPreference));
@@ -481,6 +484,8 @@ public class VideoToolsController : BaseJellyfinApiController
                 var maxHeight = string.Equals(failedJob.Resolution, "4K", StringComparison.OrdinalIgnoreCase) ? 2160 : 1080;
                 var bitrateKbps = failedJob.BitrateKbps ?? 3000;
                 var interpolate = failedJob.FrameInterpolation;
+                var retryUseQuality = failedJob.UseQuality;
+                var retryPreset = ParseQualityPreset(failedJob.Quality);
 
                 var paths = CreateTranscodePaths(failedJob.SourcePath);
                 var outputPath = paths.FinalPath;
@@ -489,9 +494,11 @@ public class VideoToolsController : BaseJellyfinApiController
                 job.WorkPath = paths.WorkPath;
                 job.Codec = codec == "av1" ? "AV1" : "H.265";
                 job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
-                job.BitrateKbps = bitrateKbps;
+                job.UseQuality = retryUseQuality;
+                job.Quality = retryUseQuality ? retryPreset.ToString().ToLowerInvariant() : null;
+                job.BitrateKbps = retryUseQuality ? null : bitrateKbps;
                 job.FrameInterpolation = interpolate;
-                StartJob(job, BuildTranscodePlan(probe, failedJob.SourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, interpolate));
+                StartJob(job, BuildTranscodePlan(probe, failedJob.SourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, interpolate, retryUseQuality, retryPreset));
                 return Accepted(job);
             }
 
@@ -1170,7 +1177,12 @@ public class VideoToolsController : BaseJellyfinApiController
         job.WorkPath = paths.WorkPath;
         job.Codec = codec == "av1" ? "AV1" : "H.265";
         job.Resolution = maxHeight == 2160 ? "4K" : "1080p";
-        job.BitrateKbps = bitrateKbps;
+
+        // Quality mode is what the user asked for; a bitrate column value would be a lie because
+        // the encoder picks the rate itself. Bitrate mode keeps the requested figure.
+        job.UseQuality = useQuality;
+        job.Quality = useQuality ? qualityPreset.ToString().ToLowerInvariant() : null;
+        job.BitrateKbps = useQuality ? null : bitrateKbps;
         job.FrameInterpolation = interpolate;
         StartJob(job, BuildTranscodePlan(probe, sourcePath, paths.WorkPath, codec, bitrateKbps, maxHeight, interpolate, useQuality, qualityPreset, preferredEncoder));
         return job;
