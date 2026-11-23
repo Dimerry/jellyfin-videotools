@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Threading.Tasks;
 using MediaBrowser.Controller.MediaEncoding;
 using Microsoft.Extensions.Logging;
 
@@ -19,6 +20,7 @@ internal static class Mp4TimingInspector
 {
     private const int MaxCacheEntries = 8192;
     private const int ProbeTimeoutMs = 20000;
+    private const int DrainTimeoutMs = 2000;
     private static readonly string[] VideoExtensions = [".mp4", ".m4v", ".mov"];
     private static readonly ConcurrentDictionary<string, bool> Cache = new(StringComparer.Ordinal);
     private static readonly bool Enabled = ReadEnabled();
@@ -257,10 +259,14 @@ internal static class Mp4TimingInspector
             return false;
         }
 
-        var errors = process.StandardError.ReadToEndAsync();
-        var output = process.StandardOutput.ReadToEnd();
+        // Both pipes must be drained concurrently: a probe that fills the 4 KB stderr
+        // buffer blocks on write, so reading stdout synchronously can deadlock until the
+        // timeout fires even though the process is healthy.
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorsTask = process.StandardError.ReadToEndAsync();
 
-        if (!process.WaitForExit(ProbeTimeoutMs))
+        var exited = process.WaitForExit(ProbeTimeoutMs);
+        if (!exited)
         {
             try
             {
@@ -270,14 +276,40 @@ internal static class Mp4TimingInspector
             {
                 // Process already exited.
             }
+        }
 
+        // Observe both tasks instead of discarding them; an abandoned read leaves the
+        // pipe undrained and the probe result unusable.
+        var output = ReadAll(outputTask);
+        _ = ReadAll(errorsTask);
+
+        if (!exited)
+        {
             return false;
         }
 
-        _ = errors;
-
         return int.TryParse(output.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var frames)
             && frames > 0;
+    }
+
+    private static string ReadAll(Task<string> readTask)
+    {
+        try
+        {
+            // Bounded wait: a process that survived Kill() would otherwise keep the pipe
+            // open and block the caller forever.
+            if (!readTask.Wait(DrainTimeoutMs))
+            {
+                return string.Empty;
+            }
+
+            return readTask.GetAwaiter().GetResult();
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException or AggregateException)
+        {
+            // The pipe was torn down while draining (for example after a kill).
+            return string.Empty;
+        }
     }
 
     private static IEnumerable<Box> EnumerateBoxes(FileStream stream, long start, long end)
