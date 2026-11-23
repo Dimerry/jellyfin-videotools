@@ -207,7 +207,7 @@ public class SqlSearchProvider : IInternalSearchProvider
 
             dbQuery = ApplyTypeFilter(dbQuery, query.IncludeItemTypes, query.ExcludeItemTypes);
             dbQuery = ApplyMediaTypeFilter(dbQuery, query.MediaTypes);
-            dbQuery = ApplyParentFilter(dbQuery, query.ParentId);
+            dbQuery = ApplyParentFilter(dbContext, dbQuery, query.ParentId);
             dbQuery = ApplyUserAccessFilter(dbContext, dbQuery, query);
             dbQuery = ExcludeVersionsOfMatchedPrimaries(dbQuery);
 
