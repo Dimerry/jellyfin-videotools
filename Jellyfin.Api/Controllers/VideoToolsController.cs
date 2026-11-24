@@ -2935,7 +2935,49 @@ public class VideoToolsController : BaseJellyfinApiController
         }
 
         System.IO.File.Move(job.WorkPath, outputPath, overwrite: true);
+        TryCopySourceTimestamps(job.SourcePath, outputPath);
         job.OutputPath = outputPath;
+    }
+
+    /// <summary>
+    /// Copies the source file's timestamps onto the finished output, so a replacement file keeps the
+    /// original's modification date instead of the time of the encode. Best effort only.
+    /// </summary>
+    /// <param name="sourcePath">The original file the job was created from.</param>
+    /// <param name="outputPath">The finished output file.</param>
+    private static void TryCopySourceTimestamps(string sourcePath, string outputPath)
+    {
+        try
+        {
+            var source = new FileInfo(sourcePath);
+            var output = new FileInfo(outputPath);
+            if (!source.Exists || !output.Exists)
+            {
+                return;
+            }
+
+            try
+            {
+                output.CreationTimeUtc = source.CreationTimeUtc;
+            }
+            catch (Exception)
+            {
+                // Not every filesystem can store a creation time; skip it.
+            }
+
+            try
+            {
+                output.LastWriteTimeUtc = source.LastWriteTimeUtc;
+            }
+            catch (Exception)
+            {
+                // Timestamps are cosmetic; a failed copy must not fail a finished job.
+            }
+        }
+        catch (Exception)
+        {
+            // Timestamps are cosmetic; a failed copy must not fail a finished job.
+        }
     }
 
     private readonly record struct MediaProbe(
