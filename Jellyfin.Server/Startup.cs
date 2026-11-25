@@ -86,17 +86,22 @@ namespace Jellyfin.Server
             var acceptJsonHeader = new MediaTypeWithQualityHeaderValue(MediaTypeNames.Application.Json, 1.0);
             var acceptXmlHeader = new MediaTypeWithQualityHeaderValue(MediaTypeNames.Application.Xml, 0.9);
             var acceptAnyHeader = new MediaTypeWithQualityHeaderValue("*/*", 0.8);
+            var networkConfig = _serverConfigurationManager.GetNetworkConfiguration();
+            var outboundProxy = new ConfigurationProxy(networkConfig.OutboundProxy, networkConfig.OutboundNoProxy);
+
             Func<IServiceProvider, HttpMessageHandler> eyeballsHttpClientHandlerDelegate = (_) => new SocketsHttpHandler()
             {
                 AutomaticDecompression = DecompressionMethods.All,
                 RequestHeaderEncodingSelector = (_, _) => Encoding.UTF8,
-                ConnectCallback = HttpClientExtension.OnConnect
+                ConnectCallback = HttpClientExtension.OnConnect,
+                Proxy = outboundProxy
             };
 
             Func<IServiceProvider, HttpMessageHandler> defaultHttpClientHandlerDelegate = (_) => new SocketsHttpHandler()
             {
                 AutomaticDecompression = DecompressionMethods.All,
-                RequestHeaderEncodingSelector = (_, _) => Encoding.UTF8
+                RequestHeaderEncodingSelector = (_, _) => Encoding.UTF8,
+                Proxy = outboundProxy
             };
 
             services.AddHttpClient(NamedClient.Default, c =>

@@ -144,6 +144,20 @@ public class NetworkConfiguration
     public string[] KnownProxies { get; set; } = Array.Empty<string>();
 
     /// <summary>
+    /// Gets or sets the outbound proxy URI (e.g. http://host:port) used for external HTTP requests
+    /// such as metadata providers, image downloads and plugin repositories. Empty = no proxy.
+    /// Requires a reboot after saving.
+    /// </summary>
+    public string OutboundProxy { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the list of hosts, IP addresses or CIDR subnets that bypass the outbound proxy.
+    /// Supports exact hostnames (e.g. api.example.com), wildcard domains (e.g. *.example.com),
+    /// IP addresses and CIDR subnets (e.g. 192.168.1.0/24).
+    /// </summary>
+    public string[] OutboundNoProxy { get; set; } = Array.Empty<string>();
+
+    /// <summary>
     /// Gets or sets a value indicating whether address names that match <see cref="VirtualInterfaceNames"/> should be ignored for the purposes of binding.
     /// </summary>
     public bool IgnoreVirtualInterfaces { get; set; } = true;
