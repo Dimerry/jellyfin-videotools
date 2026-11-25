@@ -1,16 +1,14 @@
 # Jellyfin-videotools（服务端）
 
-> **这是 [jellyfin/jellyfin](https://github.com/jellyfin/jellyfin) 的个人 fork，不是官方版本，也不打算给上游提 PR。**
+> **这是 [jellyfin/jellyfin](https://github.com/jellyfin/jellyfin) 的个人 fork，不是官方版本，与主线的区别是能简单处理视频，和对官方功能的少量优化。**
 > 所有改动都在 `videotools-12.4` 分支上。
 
 **基线：上游 Jellyfin `v12.4`（2026-10-26 稳定版）。**
-本仓库版本号 `12.4.3`：**主次版本号必须跟上游一致**，只在自己迭代时递增末位。
-原因：Jellyfin 客户端会把服务端版本号和功能下限做比较，写成 `0.1.0` 会被当成上古服务器，功能被降级甚至拒绝连接。
+本仓库版本号 `12.4.3`：12.4.x末位为本仓库迭代号，与官方不存在对应关系
 
-一句话概括：给 Jellyfin 加了**转码 / 剪辑**、**视频和图片旋转**、**后台任务队列**、**剪辑预览抽帧**、**按文件大小、比特率排序**、**搜索词直接按扩展名命中文件**，另外补了个 **Emby 兼容层**让第三方 Emby 工具能直连。
+一句话概括：给 Jellyfin 加了**视频转码**、**剪辑/旋转/画面裁切（抽帧预览）**、**后台任务队列**、**按文件大小、比特率排序**、**搜索词支持扩展名**、**出站代理**，另外补了个 **Emby 兼容层**让第三方 Emby 工具能直连。
 
 > 🤖 **本仓库全部代码由 AI 编写。**
-> 作者是一位看不懂代码的天才程序员——需求、交互、审美和验收是他，敲键盘的是 AI。
 
 配套前端：[Dimerry/jellyfin-web](https://github.com/Dimerry/jellyfin-web)（分支 `videotools-12.4`，同样基于 `v12.4`；**服务端和前端必须用同一 tag 的一对**，混搭会白屏或接口 404）。
 
@@ -22,7 +20,7 @@
 
 新增一整套 `/VideoTools` 接口，全部需要**管理员**权限。前端菜单调用这些接口。
 
-**转码**
+**1.1转码**
 
 - `POST /VideoTools/{itemId}/Transcode?codec=h265|av1&bitrateKbps=3000&resolution=1080p|4k&rateControl=quality|bitrate&quality=medium&encoder=auto`
   单条入队。**不带参数调用时使用存储的转码默认设置**（控制台 → 视频工具 → 转码默认设置）；带任一参数则全部按显式值处理。
@@ -41,7 +39,7 @@
 - **编码器偏好**：转码/剪辑对话框可手动指定优先编码器（QSV / NVENC / VA-API / AMF / 软件）；指定后仍走回退链，坏了的 GPU 不会让任务无输出。控制台 → 视频工具可存「转码默认设置」和「剪辑默认设置」，从媒体库直接入队（不弹对话框）时生效。
 - **AI 插帧（可选）**：源视频低于 23fps 时对话框出现「AI 插帧至 30 帧」勾选，用 minterpolate 运动补偿插帧，观感明显更流畅但速度慢；高帧率源不显示该选项。插帧按片段并行处理，多段同时算，速度成倍提升。
 
-**剪辑**
+**1.2.1剪辑**
 
 - `POST /VideoTools/{itemId}/Cut?startSeconds=2&endSeconds=3&rotation=0|90|180|270&cropLeft=0&cropRight=0`
 - `-ss` 输入端 + `-c copy` 流复制，秒完成、无损。
@@ -50,20 +48,14 @@
 - **旋转**：`rotation` 传 0 / 90 / 180 / 270（逆时针）。用 `-display_rotation`（放在 `-i` 之前）重写 display matrix，配合 `-c copy` 依然是流复制，**不重编码、秒完成**，画面无损。
   注意它是绝对设置：源文件自带旋转元数据（手机竖拍）时会被覆盖成所选角度，而不是叠加。
 
-**剪辑预览（抽帧）**
+**1.2.2剪辑预览（抽帧）**
 
 - `GET /VideoTools/{itemId}/Frame?timeSeconds=&maxWidth=480&rotation=0|90|180|270` → 单帧 JPEG。
 - 不进任务队列，单帧 0.1~0.3s；`SemaphoreSlim(2)` 限流，避免拖慢实时转码。
 - 按 `<itemId>_<源文件mtime>_<宽>_<旋转>_<时间>` 缓存到临时目录，命中约 2ms；超过 400 个自动清到 200 个。
 
-**图片旋转**
 
-- `POST /ImageTools/{itemId}/Rotate?degrees=90|180|270`：单张旋转。
-- `POST /ImageTools/Rotate?degrees=90` + body `["guid","guid"]`：批量旋转（多选菜单用这个），逐张串行处理并返回每张的结果。
-- 只接受 `Photo` 类型；用 ffmpeg `transpose` 滤镜**原地重写文件**（JPEG 质量 2、PNG 无损、WebP libwebp 95），旋转后重新排一次刷新任务，让数据库里的分辨率和缩略图跟上新像素。
-- 旋转和转码共用一把锁，避免同时改写同一个文件。
-
-**任务队列**
+**1.3任务队列**
 
 - `GET /VideoTools/Jobs`、`GET /VideoTools/Jobs/{id}`
 - `DELETE /VideoTools/Jobs/Finished`：清掉已完成 / 失败 / 已取消，保留运行中和排队。
@@ -73,13 +65,13 @@
 - **文件任务串行执行**：同一时间只跑一个转码/剪辑，其余 `Queued` 并带队列位置；播放时的实时转码不经过这个队列，不受限制。
 - 队列清空后延迟 **2 秒**触发一次媒体库扫描（2 秒内又来新任务则取消本次扫描，等下一次清空）。
 
-### 2. 输出文件命名（自用规则，有点激进）
+**1.4输出文件命名**
 
 - **转码**：新文件沿用源文件主名 `<源名>.mp4`；成功后源文件改名为 `<源名>.old.<原扩展名>` 保留（重名用 `名字 (1).old.mp4`）。
 - **剪辑**：新文件直接顶替源文件 `<源名>.<原扩展名>`，源文件同样改名成 `.old` 保留。
 - 两种操作都先写隐藏临时文件 `.<源名>.videotools.*`，成功后才做改名交换，**中途失败不会破坏源文件**；失败/取消会删临时文件。
 
-### 3. 转码稳定性补丁
+**1.5转码稳定性补丁**
 
 - **帧率修正**：探测 `avg_frame_rate` / `r_frame_rate`，转码时固定输出 `-r <真实帧率>`（吸附到 23.976 / 24 / 25 / 29.97 / 30 / 48 / 50 / 59.94 / 60 / 100 / 119.88 / 120）。
   原因：很多手机/remux 文件的 `r_frame_rate` 是假的（30fps 报 `120/1`），编码器按假帧率分配码率预算，导致指定 3000k 实测只有 750k 且画面卡顿。
@@ -89,25 +81,26 @@
   修的是 `.avi`(mpeg4/DivX) 直接失败的问题：QSV 解不了 mpeg4，会静默回退成 yuv420p，而 `scale_qsv` 只吃 QSV surface → 滤镜链整体失败。
 - 剪辑时长优先用 ffmpeg 探测的真实时长，探测不到才用数据库里的 `RunTimeTicks`（刚剪过的文件数据库时长是旧的）。
 
-### 4. 孤儿文件清理任务（控制台 → 计划任务）
+### 2. 图片旋转
+
+- `POST /ImageTools/{itemId}/Rotate?degrees=90|180|270`：单张旋转。
+- `POST /ImageTools/Rotate?degrees=90` + body `["guid","guid"]`：批量旋转（多选菜单用这个），逐张串行处理并返回每张的结果。
+- 只接受 `Photo` 类型；用 ffmpeg `transpose` 滤镜**原地重写文件**（JPEG 质量 2、PNG 无损、WebP libwebp 95），旋转后重新排一次刷新任务，让数据库里的分辨率和缩略图跟上新像素。
+- 旋转和转码共用一把锁，避免同时改写同一个文件。
+
+### 3. 孤儿文件清理任务（控制台 → 计划任务）
 
 - `Emby.Server.Implementations/ScheduledTasks/Tasks/OrphanFileCleanupTask.cs`，默认 30 天跑一次。
 - 遍历所有媒体库目录，把「已经没有对应媒体文件」的附属文件（poster / fanart / 字幕 / nfo 等）**移动到数据目录下按日期命名的隔离文件夹**，不直接删除，随时可以捞回来。
 - 一天以内的新文件不动，目录级（文件夹本身）的图片永远不动。
 
-### 5. Emby 兼容层
+### 4. Emby 兼容层
 
 - Jellyfin 本身没有 `/emby` 路由前缀，而按 Emby 写的第三方工具（刮削器、统计脚本、Emby 客户端）所有请求都带这个前缀。`Jellyfin.Server/Startup.cs` 里加了一个中间件，路由前把 `/emby` 段剥掉（大小写不敏感），这类工具不用改配置就能直连。
 - **注意**：Jellyfin 13 的迁移 `DisableLegacyAuthorization` 默认关闭了旧式认证，`X-Emby-Token` / `X-MediaBrowser-Token` / `api_key=` 查询参数会全部返回 401。这类工具要用起来，需要把数据目录 `config/system.xml` 里的 `EnableLegacyAuthorization` 改成 `true`（冒烟测试用 `api_key=` 查 `/emby/Persons` 即可）。
 - 代价是 API key 允许通过 URL 查询参数传递，会出现在日志 / 代理日志里（Jellyfin 自己会把中间几位打码）。局域网自用够用，公网部署请自行权衡。
 
-### 6. 排序增强
-
-- `Jellyfin.Data/Enums/ItemSortBy.cs` 新增 `Size = 30`。
-- `OrderMapper.cs` 映射 `ItemSortBy.Size → e.Size`。
-- 新增 `SizeComparer`、`BitrateComparer` 内存排序比较器（自动注册）。
-
-### 7. 时间戳损坏的 MP4 自动转码（`Jellyfin.Api/Helpers/Mp4TimingInspector.cs`）
+### 5. 时间戳损坏的 MP4 自动实时转码（`Jellyfin.Api/Helpers/Mp4TimingInspector.cs`）
 
 - 问题：有些 MP4 的视频轨**没有 `ctts`（composition time offset）表**，但码流里明明有 B 帧重排（B-pyramid）。这种文件只能提供“解码顺序”的时间戳，播放器按容器时间戳出帧就会不停丢帧/等帧，表现为**直连播放卡顿掉帧**，而实时转码反而流畅（转码会重建时间轴）。`ffmpeg -c copy` 重封装修不了，必须重编码。
 - 做法：生成播放信息时（`MediaInfoHelper.SetDeviceSpecificData`）解析 MP4 的 box 树，若「视频轨没有 `ctts`」且「ffprobe 报告 `has_b_frames > 0`」，就把 `SupportsDirectPlay` / `SupportsDirectStream` 设为 false 并加 `allowVideoStreamCopy=false`，**强制真正的视频重编码**（只重封装不解决问题）。
@@ -116,7 +109,13 @@
 - 开关：环境变量 `VIDEOTOOLS_NO_CTTS_TRANSCODE=0` 可关闭这套自动转码。
 - 扫描脚本：`scripts/scan-ctts.py` 可批量扫媒体库并统计这类文件（输出文件列表和总大小）。
 
-### 8. 搜索词按扩展名匹配 — `Jellyfin.Library/Search/SqlSearchProvider.cs`
+### 6. 排序增强
+
+- `Jellyfin.Data/Enums/ItemSortBy.cs` 新增 `Size = 30`。
+- `OrderMapper.cs` 映射 `ItemSortBy.Size → e.Size`。
+- 新增 `SizeComparer`、`BitrateComparer` 内存排序比较器（自动注册）。
+
+### 7. 搜索词按扩展名匹配 — `Jellyfin.Library/Search/SqlSearchProvider.cs`
 
 - 搜索词在匹配前会被去掉标点，形如 `.ts` 的词会退化成 `ts`，结果变成「所有标题含 t、s 的条目」。
 - 现在形如扩展名的词（点 + 字母数字，支持 `.old.mp4` 这类多段后缀）改按**条目文件路径的后缀**匹配，搜 `.ts` 就真的返回 `.ts` 文件。
