@@ -158,7 +158,7 @@ The server is expected to host the web client, but the provided content director
   解决：显式指定 `HOME`、`XDG_DATA_HOME`、`XDG_CONFIG_HOME`、`XDG_CACHE_HOME` 到一个可写目录（本仓库根目录的 `run-jellyfin.sh` 就是这么干的，可以直接抄）。
 - **`The server is expected to host the web client...`**：见上面 `--webdir`。
 - **启动后转码立刻失败，日志里有 `Error while opening encoder`**：ffmpeg 这个编码器在编译时带了、但机器上没有对应硬件。这是正常的，规划器会自动跳到下一个编码器；如果连软件编码也失败，才需要看具体报错。
-- **端口不是 8096**：端口读的是数据目录里 `config/network.xml` 的 `InternalHttpPort`，不是默认值，别照抄别人的地址。
+- **端口错误**：端口读的是数据目录里 `config/network.xml` 的 `InternalHttpPort`。
 
 > 默认端口 8096。
 
